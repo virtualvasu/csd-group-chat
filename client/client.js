@@ -10,6 +10,7 @@ const messageForm = document.getElementById('message-form');
 const messageInput = document.getElementById('message-input');
 const userList = document.getElementById('user-list');
 const typingIndicator = document.getElementById('typing-indicator');
+const connectionStatus = document.getElementById('connection-status');
 
 // Stop telling others we are typing once the input has been idle this long.
 const TYPING_IDLE_MS = 2000;
@@ -19,6 +20,20 @@ let hasJoined = false;
 let isTyping = false;
 let typingIdleTimer = null;
 const typingUsers = new Set();
+
+function updateConnectionStatus(state) {
+  const statusMap = {
+    connected: 'Connected',
+    reconnecting: 'Reconnecting…',
+    disconnected: 'Disconnected',
+  };
+
+  if (!connectionStatus) return;
+
+  connectionStatus.textContent = statusMap[state] || 'Connected';
+  connectionStatus.classList.remove('connected', 'reconnecting', 'disconnected');
+  connectionStatus.classList.add(state);
+}
 
 function joinChat() {
   const value = usernameInput.value.trim();
@@ -170,6 +185,7 @@ socket.on('online-users', (users) => {
 });
 
 socket.on('disconnect', () => {
+  updateConnectionStatus('disconnected');
   // Typing state is per-connection on the server, so drop what we know locally.
   isTyping = false;
   typingUsers.clear();
@@ -177,6 +193,29 @@ socket.on('disconnect', () => {
   appendSystemMessage('Disconnected from server. Trying to reconnect...');
 });
 
+function scheduleReconnectJoin() {
+  if (!hasJoined || !username) return;
+
+  setTimeout(() => {
+    if (socket.connected && hasJoined && username) {
+      socket.emit('join', username);
+    }
+  }, 250);
+}
+
 socket.on('connect', () => {
-  if (hasJoined && username) socket.emit('join', username);
+  updateConnectionStatus('connected');
+  scheduleReconnectJoin();
 });
+
+socket.on('reconnecting', () => {
+  updateConnectionStatus('reconnecting');
+  appendSystemMessage('Connection lost. Reconnecting to the chat...');
+});
+
+socket.on('reconnect', () => {
+  updateConnectionStatus('connected');
+  scheduleReconnectJoin();
+});
+
+updateConnectionStatus('connected');

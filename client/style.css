@@ -80,11 +80,44 @@ body {
   padding: 1rem;
 }
 
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
 .sidebar h2 {
   font-size: 0.9rem;
   text-transform: uppercase;
   color: #9ca3af;
-  margin-bottom: 0.75rem;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.connection-status.connected {
+  background: rgba(34, 197, 94, 0.16);
+  color: #bbf7d0;
+}
+
+.connection-status.reconnecting {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fde68a;
+}
+
+.connection-status.disconnected {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fecaca;
 }
 
 #user-list {

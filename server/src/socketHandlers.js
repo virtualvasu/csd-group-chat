@@ -25,12 +25,16 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       }
 
       // Usernames are unique per server, so a second tab using the same name
-      // is rejected here as well.
+      // is rejected here as well. A reconnecting client may briefly collide with
+      // a recently disconnected socket, so allow a short reclaim window for that case.
       if (presence.isUsernameTaken(result.username)) {
-        socket.emit('join-error', {
-          message: `Username "${result.username}" is already taken. It may be open in another tab.`,
-        });
-        return;
+        const reclaimed = presence.reclaimUsername(socket.id, result.username);
+        if (!reclaimed) {
+          socket.emit('join-error', {
+            message: `Username "${result.username}" is already taken. It may be open in another tab.`,
+          });
+          return;
+        }
       }
 
       presence.add(socket.id, result.username);
