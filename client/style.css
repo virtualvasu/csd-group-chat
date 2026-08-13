@@ -140,6 +140,14 @@ body {
   font-style: italic;
 }
 
+#typing-indicator {
+  min-height: 1.2rem;
+  padding: 0 1rem 0.25rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+  font-style: italic;
+}
+
 #message-form {
   display: flex;
   padding: 1rem;
