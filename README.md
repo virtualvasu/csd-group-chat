@@ -5,11 +5,16 @@ server, multiple browser clients — everyone in one shared room.
 
 ## MVP features
 
-- Join with a username
+- Join with a username (unique while you are online)
 - Real-time message broadcast to everyone in the room
-- Join / leave notifications
+- Join / leave notifications with timestamps
 - Live online-users list
+- "User is typing..." indicator
 - Graceful handling of client disconnects (tab close, refresh, network drop)
+
+A username can only be online once. Joining from a second tab with a name that
+is already in use is rejected on the join screen; use a different name, or
+close the first tab to free it. See `server/README.md` for details.
 
 ## Running the server
 
@@ -95,5 +100,4 @@ client/   Static HTML/CSS/JS frontend (no build step required)
 
 - Message history / persistence
 - Private (1:1) messaging
-- Typing indicators
 - Improved styling / mobile layout
