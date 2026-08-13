@@ -24,8 +24,12 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         return;
       }
 
+      // Usernames are unique per server, so a second tab using the same name
+      // is rejected here as well.
       if (presence.isUsernameTaken(result.username)) {
-        socket.emit('join-error', { message: `Username "${result.username}" is already taken.` });
+        socket.emit('join-error', {
+          message: `Username "${result.username}" is already taken. It may be open in another tab.`,
+        });
         return;
       }
 
@@ -33,7 +37,7 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       socket.data.username = result.username;
 
       socket.emit('join-success', { username: result.username });
-      socket.broadcast.emit('user-joined', { username: result.username });
+      socket.broadcast.emit('user-joined', { username: result.username, timestamp: Date.now() });
       io.emit('online-users', presence.list());
     })
   );
@@ -67,13 +71,23 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
   );
 
   socket.on(
+    'typing',
+    safeHandler((isTyping) => {
+      const username = socket.data.username;
+      if (!username) return;
+
+      socket.broadcast.emit('user-typing', { username, isTyping: Boolean(isTyping) });
+    })
+  );
+
+  socket.on(
     'disconnect',
     safeHandler(() => {
       const username = presence.remove(socket.id);
       messageRateLimiter.clear(socket.id);
       if (!username) return;
 
-      socket.broadcast.emit('user-left', { username });
+      socket.broadcast.emit('user-left', { username, timestamp: Date.now() });
       io.emit('online-users', presence.list());
     })
   );
