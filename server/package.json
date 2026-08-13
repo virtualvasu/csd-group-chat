@@ -1,0 +1,13 @@
+{
+  "name": "csd-group-chat-server",
+  "version": "1.0.0",
+  "description": "Backend server for real-time group chat (WebSockets / Socket.IO)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
