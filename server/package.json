@@ -4,10 +4,14 @@
   "description": "Backend server for real-time group chat (WebSockets / Socket.IO)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
   }
 }

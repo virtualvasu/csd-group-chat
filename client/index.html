@@ -18,7 +18,10 @@
 
   <div id="chat-screen" class="screen hidden">
     <div class="sidebar">
-      <h2>Online</h2>
+      <div class="sidebar-header">
+        <h2>Online</h2>
+        <span id="connection-status" class="connection-status connected" aria-live="polite">Connected</span>
+      </div>
       <ul id="user-list"></ul>
     </div>
     <div class="chat-main">
