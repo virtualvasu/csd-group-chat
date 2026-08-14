@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Light theme. The one functional idea: each person's name gets a fixed
+ * color (hashed from their username, see lib/userColor.ts) used for their
+ * name label and message rule, so you can scan who said what in a fast
+ * multi-person thread without re-reading names.
+ */
+:root {
+  --paper: #ffffff;
+  --linen: #f6f6f2;
+  --ink: #201f1b;
+  --mist: #767468;
+  --hairline: #e4e1d8;
+  --moss: #3f6b4f;
+  --moss-soft: #e8f0ea;
+  --rust: #b3432e;
+  --amber: #9a7418;
+
+  --background: var(--paper);
+  --foreground: var(--ink);
+  --card: #ffffff;
+  --card-foreground: var(--ink);
+  --popover: #ffffff;
+  --popover-foreground: var(--ink);
+  --primary: var(--moss);
+  --primary-foreground: #ffffff;
+  --secondary: var(--linen);
+  --secondary-foreground: var(--ink);
+  --muted: var(--linen);
+  --muted-foreground: var(--mist);
+  --accent: var(--moss-soft);
+  --accent-foreground: var(--moss);
+  --destructive: var(--rust);
+  --destructive-foreground: #ffffff;
+  --border: var(--hairline);
+  --input: var(--hairline);
+  --ring: var(--moss);
+  --radius: 0.5rem;
+
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-linen: var(--linen);
+  --color-ink: var(--ink);
+  --color-mist: var(--mist);
+  --color-hairline: var(--hairline);
+  --color-moss: var(--moss);
+  --color-moss-soft: var(--moss-soft);
+  --color-rust: var(--rust);
+  --color-amber: var(--amber);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --font-display: var(--font-display);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+  }
+}

@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 3000;
 const presence = new Presence();
 const messageRateLimiter = new RateLimiter();
 
-app.use(express.static(path.join(__dirname, '..', 'client')));
+app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
 app.use(createHealthRouter(presence));
 
 io.on('connection', (socket) => {

@@ -5,9 +5,12 @@ The goal is to confirm the required flow works across machines, not just on a si
 
 ## Required setup
 
-1. Start the backend on one lab machine:
+1. Build the frontend and start the backend on one lab machine:
    ```bash
-   cd server
+   cd client
+   npm install
+   npm run build
+   cd ../server
    npm install
    npm start
    ```
