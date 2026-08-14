@@ -18,14 +18,26 @@ close the first tab to free it. See `server/README.md` for details.
 
 ## Running the server
 
+The frontend is a React app that needs to be built once before the server
+can serve it:
+
+```bash
+cd client
+npm install
+npm run build
+```
+
+Then start the backend:
+
 ```bash
 cd server
 npm install
 npm start
 ```
 
-The server starts on `http://localhost:3000` and also serves the frontend
-(`client/`), so there's nothing separate to run for the UI.
+The server starts on `http://localhost:3000` and also serves the built
+frontend (`client/dist`), so there's nothing separate to run for the UI.
+For frontend development with hot reload, see `client/README.md`.
 
 ## Connecting from lab machines
 
@@ -113,7 +125,7 @@ sequenceDiagram
 
 ```
 server/   Express + Socket.IO backend (message broadcast, join/leave, disconnects)
-client/   Static HTML/CSS/JS frontend (no build step required)
+client/   React + TypeScript + shadcn/ui frontend (build with `npm run build`)
 ```
 
 ## Testing and verification
