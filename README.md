@@ -66,9 +66,22 @@ The server connects to MongoDB before it starts accepting clients. If
 `MONGODB_URI` is missing or wrong, it stops with a message saying so rather
 than starting up and losing messages.
 
-The server starts on `http://localhost:3000` and also serves the built
+The server starts on `http://localhost:4000` and also serves the built
 frontend (`client/dist`), so there's nothing separate to run for the UI.
 For frontend development with hot reload, see `client/README.md`.
+
+## Ports
+
+| Port | What runs there | When |
+|---|---|---|
+| `4000` | The chat server (Express + Socket.IO), which also serves the built client | Always |
+| `3000` | The client dev server (Vite), with hot reload | Only during frontend development |
+
+During development both run at once: Vite on 3000 serves the UI and forwards
+`/socket.io` and `/health` to the chat server on 4000. For the lab demo you only
+need the chat server, since it serves the built client itself.
+
+Set `PORT` in `server/.env` to move the chat server somewhere else.
 
 ## Connecting from lab machines
 
@@ -76,10 +89,10 @@ For frontend development with hot reload, see `client/README.md`.
 2. Find that machine's LAN IP:
    - Linux: `hostname -I`
    - Windows: `ipconfig`
-3. On the other 3 machines, open `http://<server-ip>:3000` in a browser.
+3. On the other 3 machines, open `http://<server-ip>:4000` in a browser.
 4. Everyone enters a username and joins the same room.
 5. If the browser cannot connect, check that the server machine allows inbound
-   traffic on port `3000` and that all lab machines are on the same network
+   traffic on port `4000` and that all lab machines are on the same network
    segment or VPN.
 
 This project was validated on a multi-machine lab setup with one shared backend

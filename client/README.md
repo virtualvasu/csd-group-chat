@@ -14,8 +14,14 @@ npm install
 npm run dev
 ```
 
-The dev server proxies `/socket.io` and `/health` to `http://localhost:3000`,
-so run the backend (`cd ../server && npm start`) alongside it.
+The dev server runs on port **3000** and proxies `/socket.io` and `/health` to
+the backend on `http://localhost:4000`, so run the backend
+(`cd ../server && npm start`) alongside it.
+
+The port is fixed (`strictPort`), so Vite fails instead of quietly moving to
+another port if 3000 is busy — the proxy setup depends on it being 3000. If you
+hit "Port 3000 is already in use", something else has it: check with
+`ss -ltnp | grep :3000`.
 
 ## Build
 

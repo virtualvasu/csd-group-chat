@@ -13,7 +13,9 @@ const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer);
 
-const PORT = process.env.PORT || 3000;
+// 4000, not 3000: the client dev server takes 3000, so keeping the backend off
+// that port lets both run at once.
+const PORT = process.env.PORT || 4000;
 
 const presence = new Presence();
 const messageRateLimiter = new RateLimiter();

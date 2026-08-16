@@ -23,7 +23,7 @@ so there is no `dotenv` dependency). Copy `.env.example` to `.env` and fill it i
 |---|---|---|---|
 | `MONGODB_URI` | yes | — | MongoDB Atlas connection string |
 | `MONGODB_DB_NAME` | no | `csd_group_chat` | Database name inside the cluster |
-| `PORT` | no | `3000` | Port the chat server listens on |
+| `PORT` | no | `4000` | Port the chat server listens on. 3000 is left free for the client dev server |
 
 `MONGODB_URI` deliberately has no default. A default pointing at localhost would
 let the server start and quietly store messages somewhere nobody intended, so a

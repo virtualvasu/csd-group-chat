@@ -11,12 +11,15 @@ export default defineConfig({
     },
   },
   server: {
+    host: true,
+    port: 3000,
+    strictPort: true,
     proxy: {
       '/socket.io': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:4000',
         ws: true,
       },
-      '/health': 'http://localhost:3000',
+      '/health': 'http://localhost:4000',
     },
   },
 })

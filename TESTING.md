@@ -15,7 +15,7 @@ The goal is to confirm the required flow works across machines, not just on a si
    npm start
    ```
 2. Find the server IP and share it with the other three students.
-3. Open the app on each machine at `http://<server-ip>:3000`.
+3. Open the app on each machine at `http://<server-ip>:4000`.
 4. Each person joins using a different username.
 
 ## End-to-end checks
