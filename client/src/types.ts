@@ -17,6 +17,16 @@ export type SignatureStatus = "valid" | "invalid" | "unsigned" | "unknown";
 // What MessageTrustBadge can render. Either verdict can be handed to it.
 export type TrustStatus = SignatureStatus | IntegrityStatus;
 
+// The message exactly as the database holds it, base64-encoded. Shown in the
+// encrypted view and the inspector, so that "messages are not stored as
+// plaintext" is something a reader can check rather than take on trust.
+export interface StoredForm {
+  ciphertext: string | null;
+  nonce: string | null;
+  signature: string | null;
+  clientTimestamp: number | null;
+}
+
 export interface ChatMessageItem {
   kind: "chat";
   id: string;
@@ -33,6 +43,10 @@ export interface ChatMessageItem {
   senderPublicKey: string | null;
   /** Present only when the stored copy failed its integrity check. */
   integrity?: IntegrityStatus;
+  /** The stored database record behind this message. */
+  stored: StoredForm | null;
+  /** True when this arrived in the history replay rather than live. */
+  fromHistory: boolean;
 }
 
 export interface SystemMessageItem {
@@ -61,4 +75,6 @@ export interface ServerMessage {
   senderPublicKey: string | null;
   /** Present only when the stored copy failed its integrity check. */
   integrity?: IntegrityStatus;
+  /** The stored database record behind this message. */
+  stored?: StoredForm;
 }
