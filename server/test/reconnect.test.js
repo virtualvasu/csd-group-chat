@@ -8,6 +8,10 @@ const { Presence } = require('../src/presence');
 const { RateLimiter } = require('../src/rateLimiter');
 const { registerSocketHandlers } = require('../src/socketHandlers');
 const { connectTestDb, closeTestDb, skipReason } = require('./helpers/testDb');
+const { useTestEncryptionKey } = require('./helpers/testKey');
+const { waitForEvent, createIdentity, loginAs } = require('./helpers/testIdentity');
+
+useTestEncryptionKey();
 
 // Joining now also reads the stored messages, so these tests need a database
 // as well. Without one the join still works, but it logs an error every time.
@@ -18,16 +22,6 @@ let ioServer;
 let port;
 let presence;
 let rateLimiter;
-
-function waitForEvent(socket, eventName, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${eventName}`)), timeoutMs);
-    socket.once(eventName, (payload) => {
-      clearTimeout(timer);
-      resolve(payload);
-    });
-  });
-}
 
 test.before(async () => {
   if (needsDatabase) await connectTestDb('reconnect');
@@ -58,7 +52,12 @@ test.after(async () => {
   if (needsDatabase) await closeTestDb();
 });
 
-test('rejoining a username after disconnect keeps a single presence entry', async () => {
+// Logging in reads and writes the sender key store, so this one needs a
+// database even though what it is really checking is presence bookkeeping.
+test('rejoining a username after disconnect keeps a single presence entry', { skip: skipReason() }, async () => {
+  const kunal = await createIdentity();
+  const asha = await createIdentity();
+
   const first = io(`http://localhost:${port}`, {
     transports: ['websocket'],
     forceNew: true,
@@ -77,9 +76,6 @@ test('rejoining a username after disconnect keeps a single presence entry', asyn
       waitForEvent(second, 'connect'),
     ]);
 
-    const firstJoinPromise = waitForEvent(first, 'join-success');
-    const secondJoinPromise = waitForEvent(second, 'join-success');
-
     const secondUsersPromise = new Promise((resolve) => {
       const onOnlineUsers = (list) => {
         if (list.includes('Kunal') && list.includes('Asha')) {
@@ -90,15 +86,11 @@ test('rejoining a username after disconnect keeps a single presence entry', asyn
       second.on('online-users', onOnlineUsers);
     });
 
-    first.emit('join', 'Kunal');
-    second.emit('join', 'Asha');
+    await loginAs(first, 'Kunal', kunal);
+    await loginAs(second, 'Asha', asha);
 
-    const firstJoin = await firstJoinPromise;
-    const secondJoin = await secondJoinPromise;
     const userListAfterJoin = await secondUsersPromise;
 
-    assert.equal(firstJoin.username, 'Kunal');
-    assert.equal(secondJoin.username, 'Asha');
     assert.ok(userListAfterJoin.includes('Kunal'));
     assert.ok(userListAfterJoin.includes('Asha'));
 
@@ -113,7 +105,6 @@ test('rejoining a username after disconnect keeps a single presence entry', asyn
 
     await waitForEvent(reconnecting, 'connect');
 
-    const reconnectingJoinPromise = waitForEvent(reconnecting, 'join-success');
     const secondUpdatedUsersPromise = new Promise((resolve) => {
       const onOnlineUsers = (list) => {
         const count = list.filter((name) => name === 'Kunal').length;
@@ -125,11 +116,11 @@ test('rejoining a username after disconnect keeps a single presence entry', asyn
       second.on('online-users', onOnlineUsers);
     });
 
-    reconnecting.emit('join', 'Kunal');
-    const rejoinSuccess = await reconnectingJoinPromise;
+    // The same identity, because the username is bound to it now. Coming back
+    // with a fresh key pair would be refused rather than treated as Kunal.
+    await loginAs(reconnecting, 'Kunal', kunal);
     const userListAfterRejoin = await secondUpdatedUsersPromise;
 
-    assert.equal(rejoinSuccess.username, 'Kunal');
     assert.ok(userListAfterRejoin.includes('Kunal'));
     assert.equal(userListAfterRejoin.filter((name) => name === 'Kunal').length, 1);
 

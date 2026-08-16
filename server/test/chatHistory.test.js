@@ -1,6 +1,5 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { webcrypto } = require('node:crypto');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const { io } = require('socket.io-client');
@@ -10,9 +9,14 @@ const { RateLimiter } = require('../src/rateLimiter');
 const { registerSocketHandlers } = require('../src/socketHandlers');
 const database = require('../src/db');
 const { COLLECTION, toBuffer } = require('../src/db/messageRepository');
-const { buildCanonicalBytes } = require('../src/crypto/canonical');
 const { connectTestDb, clearTestDb, closeTestDb, skipReason } = require('./helpers/testDb');
 const { useTestEncryptionKey } = require('./helpers/testKey');
+const {
+  waitForEvent,
+  createIdentity,
+  loginAs,
+  sendSigned,
+} = require('./helpers/testIdentity');
 
 useTestEncryptionKey();
 
@@ -22,81 +26,17 @@ let httpServer;
 let ioServer;
 let port;
 
-function waitForEvent(socket, eventName, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timed out waiting for ${eventName}`)),
-      timeoutMs
-    );
-    socket.once(eventName, (payload) => {
-      clearTimeout(timer);
-      resolve(payload);
-    });
-  });
-}
-
 function connectClient() {
   return io(`http://localhost:${port}`, { transports: ['websocket'], forceNew: true });
 }
 
 // Sends messages one at a time, waiting for each broadcast, so they keep their
 // order and are all stored before the next step of a test runs.
-async function send(socket, texts) {
+async function send(socket, identity, username, texts) {
   for (const text of texts) {
-    const broadcast = waitForEvent(socket, 'chat-message');
-    socket.emit('chat-message', text);
     // eslint-disable-next-line no-await-in-loop
-    await broadcast;
+    await sendSigned(socket, identity, username, text);
   }
-}
-
-// Joins the chat and returns the history the server sent on the way in.
-async function joinAs(socket, username, publicKey = null) {
-  const historyPromise = waitForEvent(socket, 'chat-history');
-  socket.emit('join', publicKey ? { username, publicKey } : username);
-  await waitForEvent(socket, 'join-success');
-
-  return historyPromise;
-}
-
-// Stands in for a browser holding an ECDSA identity, so these tests can send
-// messages that are signed the way a real client signs them.
-async function createIdentity() {
-  const pair = await webcrypto.subtle.generateKey(
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['sign', 'verify']
-  );
-
-  const spki = Buffer.from(await webcrypto.subtle.exportKey('spki', pair.publicKey));
-
-  return {
-    publicKey: spki.toString('base64'),
-    async sign(username, timestamp, text) {
-      const signature = await webcrypto.subtle.sign(
-        { name: 'ECDSA', hash: 'SHA-256' },
-        pair.privateKey,
-        buildCanonicalBytes(username, timestamp, text)
-      );
-
-      return Buffer.from(signature).toString('base64');
-    },
-  };
-}
-
-// Sends one signed message and resolves once the server has broadcast it,
-// which is also when it is safely stored.
-async function sendSigned(socket, identity, username, text) {
-  const timestamp = Date.now();
-  const broadcast = waitForEvent(socket, 'chat-message');
-
-  socket.emit('chat-message', {
-    text,
-    timestamp,
-    signature: await identity.sign(username, timestamp, text),
-  });
-
-  return broadcast;
 }
 
 test.before(async () => {
@@ -134,15 +74,14 @@ test.after(async () => {
 });
 
 test('a broadcast message carries the id it was stored under', { skip }, async () => {
+  const identity = await createIdentity();
   const client = connectClient();
 
   try {
     await waitForEvent(client, 'connect');
-    await joinAs(client, 'Asha');
+    await loginAs(client, 'Asha', identity);
 
-    const messagePromise = waitForEvent(client, 'chat-message');
-    client.emit('chat-message', 'hello');
-    const message = await messagePromise;
+    const message = await sendSigned(client, identity, 'Asha', 'hello');
 
     assert.equal(message.text, 'hello');
     assert.equal(message.username, 'Asha');
@@ -154,20 +93,22 @@ test('a broadcast message carries the id it was stored under', { skip }, async (
 });
 
 test('someone joining later receives the earlier messages', { skip }, async () => {
+  const asha = await createIdentity();
+  const kunal = await createIdentity();
   const first = connectClient();
 
   try {
     await waitForEvent(first, 'connect');
-    const emptyHistory = await joinAs(first, 'Asha');
+    const emptyHistory = await loginAs(first, 'Asha', asha);
     assert.deepEqual(emptyHistory, []);
 
-    await send(first, ['one', 'two']);
+    await send(first, asha, 'Asha', ['one', 'two']);
 
     const second = connectClient();
 
     try {
       await waitForEvent(second, 'connect');
-      const history = await joinAs(second, 'Kunal');
+      const history = await loginAs(second, 'Kunal', kunal);
 
       assert.deepEqual(
         history.map((message) => message.text),
@@ -184,15 +125,14 @@ test('someone joining later receives the earlier messages', { skip }, async () =
 });
 
 test('messages survive a server restart', { skip }, async () => {
+  const asha = await createIdentity();
+  const kunal = await createIdentity();
   const client = connectClient();
 
   try {
     await waitForEvent(client, 'connect');
-    await joinAs(client, 'Asha');
-
-    const sent = waitForEvent(client, 'chat-message');
-    client.emit('chat-message', 'still here tomorrow');
-    await sent;
+    await loginAs(client, 'Asha', asha);
+    await sendSigned(client, asha, 'Asha', 'still here tomorrow');
   } finally {
     client.disconnect();
   }
@@ -219,7 +159,7 @@ test('messages survive a server restart', { skip }, async () => {
 
   try {
     await waitForEvent(afterRestart, 'connect');
-    const history = await joinAs(afterRestart, 'Kunal');
+    const history = await loginAs(afterRestart, 'Kunal', kunal);
 
     assert.deepEqual(
       history.map((message) => message.text),
@@ -233,12 +173,13 @@ test('messages survive a server restart', { skip }, async () => {
 });
 
 test('a stored message does not hold readable text', { skip }, async () => {
+  const asha = await createIdentity();
   const client = connectClient();
 
   try {
     await waitForEvent(client, 'connect');
-    await joinAs(client, 'Asha');
-    await send(client, ['meet me at four']);
+    await loginAs(client, 'Asha', asha);
+    await send(client, asha, 'Asha', ['meet me at four']);
   } finally {
     client.disconnect();
   }
@@ -250,12 +191,14 @@ test('a stored message does not hold readable text', { skip }, async () => {
 });
 
 test('a tampered message is flagged and the others still load', { skip }, async () => {
+  const asha = await createIdentity();
+  const kunal = await createIdentity();
   const first = connectClient();
 
   try {
     await waitForEvent(first, 'connect');
-    await joinAs(first, 'Asha');
-    await send(first, ['safe one', 'edited one']);
+    await loginAs(first, 'Asha', asha);
+    await send(first, asha, 'Asha', ['safe one', 'edited one']);
   } finally {
     first.disconnect();
   }
@@ -272,7 +215,7 @@ test('a tampered message is flagged and the others still load', { skip }, async 
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await joinAs(second, 'Kunal');
+    const history = await loginAs(second, 'Kunal', kunal);
 
     assert.equal(history.length, 2);
     assert.equal(history[0].text, 'safe one');
@@ -285,6 +228,95 @@ test('a tampered message is flagged and the others still load', { skip }, async 
   }
 });
 
+// Logging in has to prove possession of a private key, not just knowledge of a
+// public one. A public key is not a secret — it is broadcast with every message
+// its owner sends — so these two pin down that presenting one is not enough.
+
+test("presenting someone else's public key does not get you their username", { skip }, async () => {
+  const asha = await createIdentity();
+  const impostor = await createIdentity();
+
+  const real = connectClient();
+
+  try {
+    await waitForEvent(real, 'connect');
+    await loginAs(real, 'Asha', asha);
+  } finally {
+    real.disconnect();
+  }
+
+  const fake = connectClient();
+
+  try {
+    await waitForEvent(fake, 'connect');
+
+    // Asha's public key is readable by anyone who saw one of her messages, so
+    // the impostor gets this far without any secret at all.
+    const challengePromise = waitForEvent(fake, 'auth-challenge');
+    fake.emit('auth-start', { username: 'Asha', publicKey: asha.publicKey });
+    const { challenge } = await challengePromise;
+
+    // What they cannot do is sign the challenge with Asha's private key.
+    const errorPromise = waitForEvent(fake, 'join-error');
+    fake.emit('auth-response', {
+      signature: await impostor.signBytes(Buffer.from(challenge, 'base64')),
+    });
+
+    const { message } = await errorPromise;
+    assert.match(message, /private key/i);
+  } finally {
+    fake.disconnect();
+  }
+});
+
+test('an unsigned message is refused and never stored', { skip }, async () => {
+  const asha = await createIdentity();
+  const client = connectClient();
+
+  try {
+    await waitForEvent(client, 'connect');
+    await loginAs(client, 'Asha', asha);
+
+    // The shape the old unsigned client used.
+    const bareStringError = waitForEvent(client, 'message-error');
+    client.emit('chat-message', 'no signature here');
+    assert.match((await bareStringError).message, /unsigned/i);
+
+    // And a well-formed payload that simply omits the signature.
+    const missingSignatureError = waitForEvent(client, 'message-error');
+    client.emit('chat-message', { text: 'still no signature', timestamp: Date.now() });
+    assert.match((await missingSignatureError).message, /unsigned/i);
+
+    const stored = await database.getDb().collection(COLLECTION).countDocuments({});
+    assert.equal(stored, 0);
+  } finally {
+    client.disconnect();
+  }
+});
+
+test('a message carries the stored ciphertext alongside its text', { skip }, async () => {
+  const asha = await createIdentity();
+  const client = connectClient();
+
+  try {
+    await waitForEvent(client, 'connect');
+    await loginAs(client, 'Asha', asha);
+
+    const broadcast = await sendSigned(client, asha, 'Asha', 'show me the bytes');
+
+    // What the client needs to render its encrypted view without asking again.
+    assert.equal(typeof broadcast.stored.ciphertext, 'string');
+    assert.equal(Buffer.from(broadcast.stored.nonce, 'base64').length, 12);
+    assert.ok(!Buffer.from(broadcast.stored.ciphertext, 'base64').toString('utf8').includes('show me the bytes'));
+
+    // And it matches the row that history will hand back later.
+    const persisted = await database.getDb().collection(COLLECTION).findOne({});
+    assert.equal(toBuffer(persisted.ciphertext).toString('base64'), broadcast.stored.ciphertext);
+  } finally {
+    client.disconnect();
+  }
+});
+
 // The next three cover the seam between the two features: messages are stored
 // encrypted, but the signature is over the plaintext, so history has to decrypt
 // before it can verify. Getting that order wrong makes every signature look
@@ -292,11 +324,12 @@ test('a tampered message is flagged and the others still load', { skip }, async 
 
 test('a signature still verifies after a round trip through storage', { skip }, async () => {
   const identity = await createIdentity();
+  const kunal = await createIdentity();
   const first = connectClient();
 
   try {
     await waitForEvent(first, 'connect');
-    await joinAs(first, 'Asha', identity.publicKey);
+    await loginAs(first, 'Asha', identity);
     await sendSigned(first, identity, 'Asha', 'signed and stored');
   } finally {
     first.disconnect();
@@ -306,7 +339,7 @@ test('a signature still verifies after a round trip through storage', { skip }, 
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await joinAs(second, 'Kunal');
+    const history = await loginAs(second, 'Kunal', kunal);
 
     assert.equal(history.length, 1);
     assert.equal(history[0].text, 'signed and stored');
@@ -320,11 +353,12 @@ test('a signature still verifies after a round trip through storage', { skip }, 
 
 test('editing a stored signature is caught but leaves the text readable', { skip }, async () => {
   const identity = await createIdentity();
+  const kunal = await createIdentity();
   const first = connectClient();
 
   try {
     await waitForEvent(first, 'connect');
-    await joinAs(first, 'Asha', identity.publicKey);
+    await loginAs(first, 'Asha', identity);
     await sendSigned(first, identity, 'Asha', 'who really sent this');
   } finally {
     first.disconnect();
@@ -341,7 +375,7 @@ test('editing a stored signature is caught but leaves the text readable', { skip
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await joinAs(second, 'Kunal');
+    const history = await loginAs(second, 'Kunal', kunal);
 
     // The message is readable and its bytes are intact, so integrity passes.
     // What failed is the claim about who wrote it.
@@ -355,11 +389,12 @@ test('editing a stored signature is caught but leaves the text readable', { skip
 
 test('a message that will not decrypt is not blamed on its sender', { skip }, async () => {
   const identity = await createIdentity();
+  const kunal = await createIdentity();
   const first = connectClient();
 
   try {
     await waitForEvent(first, 'connect');
-    await joinAs(first, 'Asha', identity.publicKey);
+    await loginAs(first, 'Asha', identity);
     await sendSigned(first, identity, 'Asha', 'bytes about to be broken');
   } finally {
     first.disconnect();
@@ -375,7 +410,7 @@ test('a message that will not decrypt is not blamed on its sender', { skip }, as
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await joinAs(second, 'Kunal');
+    const history = await loginAs(second, 'Kunal', kunal);
 
     assert.equal(history[0].text, null);
     assert.equal(history[0].integrity, 'failed');

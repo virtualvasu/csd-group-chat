@@ -2,9 +2,17 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MessageTrustBadge } from "@/components/MessageTrustBadge";
+import { MessageRecord } from "@/components/MessageRecord";
+import { HistoryPanel } from "@/components/HistoryPanel";
 import { cn } from "@/lib/utils";
 import { colorForUser } from "@/lib/userColor";
 import type { ConnectionStatus, TimelineItem } from "@/types";
+
+// Which form of a message the timeline is showing. "text" is what was written;
+// "stored" is the ciphertext the database actually holds for it. Reading the
+// same conversation both ways is the point — it makes "messages are not stored
+// as plaintext" something you can see rather than something you are told.
+type MessageView = "text" | "stored";
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
   connected: "Connected",
@@ -37,6 +45,44 @@ function ConnectionBadge({ status }: { status: ConnectionStatus }) {
   );
 }
 
+function ViewToggle({
+  view,
+  onChange,
+}: {
+  view: MessageView;
+  onChange: (view: MessageView) => void;
+}) {
+  const options: { value: MessageView; label: string }[] = [
+    { value: "text", label: "Message" },
+    { value: "stored", label: "Stored bytes" },
+  ];
+
+  return (
+    <div
+      role="group"
+      aria-label="Message view"
+      className="inline-flex rounded-md border border-hairline bg-linen p-0.5"
+    >
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          aria-pressed={view === option.value}
+          onClick={() => onChange(option.value)}
+          className={cn(
+            "rounded-[0.2rem] px-2.5 py-1 font-mono text-[0.7rem] transition-colors",
+            view === option.value
+              ? "bg-paper text-ink shadow-sm"
+              : "text-mist hover:text-ink"
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function TypingIndicator({ users }: { users: string[] }) {
   if (users.length === 0) return <span className="opacity-0">·</span>;
   const label =
@@ -54,6 +100,7 @@ export function ChatScreen({
   onlineUsers,
   typingUsers,
   timeline,
+  historyCount,
   onSend,
   onTyping,
 }: {
@@ -62,10 +109,14 @@ export function ChatScreen({
   onlineUsers: string[];
   typingUsers: string[];
   timeline: TimelineItem[];
+  historyCount: number;
   onSend: (text: string) => void;
   onTyping: (typing: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [view, setView] = useState<MessageView>("text");
+  const [showHistory, setShowHistory] = useState(false);
+  const [openRecordId, setOpenRecordId] = useState<string | null>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomAnchor = useRef<HTMLDivElement>(null);
@@ -130,6 +181,24 @@ export function ChatScreen({
       </aside>
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-paper">
+        <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-hairline bg-card px-4 py-2.5 md:px-6">
+          <button
+            type="button"
+            onClick={() => setShowHistory((open) => !open)}
+            aria-expanded={showHistory}
+            className="rounded-md border border-hairline bg-linen px-2.5 py-1 font-mono text-[0.7rem] text-mist transition-colors hover:text-ink"
+          >
+            {historyCount === 1
+              ? "1 message restored"
+              : `${historyCount} messages restored`}
+            <span aria-hidden="true"> {showHistory ? "▲" : "▼"}</span>
+          </button>
+
+          <ViewToggle view={view} onChange={setView} />
+        </header>
+
+        {showHistory && <HistoryPanel timeline={timeline} />}
+
         <div
           ref={scrollRef}
           onScroll={handleScroll}
@@ -183,29 +252,54 @@ export function ChatScreen({
                   // The text of this one is not shown at all. What the database
                   // holds is not what was sent, so there is nothing here worth
                   // displaying as the message.
-                  <div
+                  <button
+                    type="button"
+                    aria-expanded={openRecordId === item.id}
+                    onClick={() =>
+                      setOpenRecordId((current) =>
+                        current === item.id ? null : item.id
+                      )
+                    }
                     className={cn(
-                      "flex max-w-[75ch] flex-col gap-1 rounded-md border border-rust/40 bg-rust/5 px-3 py-1.5",
+                      "flex max-w-[75ch] cursor-pointer flex-col gap-1 rounded-md border border-rust/40 bg-rust/5 px-3 py-1.5 text-left transition-colors hover:bg-rust/10",
                       item.own ? "items-end" : "items-start"
                     )}
                   >
                     <MessageTrustBadge status={item.integrity} />
                     <p className="text-[0.925rem] leading-relaxed text-mist italic">
-                      ⚠ This message failed integrity verification and may have
-                      been modified
+                      The stored copy of this message no longer matches its
+                      authentication tag, so it was changed after it was sent.
                     </p>
-                  </div>
+                  </button>
                 ) : (
-                  <p
+                  // The bubble is a button: pressing it unfolds the database row
+                  // behind the message. Nothing about the message is hidden by
+                  // this, so it stays a plain toggle rather than a dialog.
+                  <button
+                    type="button"
+                    aria-expanded={openRecordId === item.id}
+                    onClick={() =>
+                      setOpenRecordId((current) =>
+                        current === item.id ? null : item.id
+                      )
+                    }
                     className={cn(
-                      "max-w-[75ch] rounded-md px-3 py-1.5 text-[0.925rem] leading-relaxed break-words",
+                      "max-w-[75ch] cursor-pointer rounded-md px-3 py-1.5 text-left text-[0.925rem] leading-relaxed break-words transition-colors hover:bg-linen",
                       item.own ? "border-r-2" : "border-l-2"
                     )}
                     style={{ borderColor: colorForUser(item.username) }}
                   >
-                    {item.text}
-                  </p>
+                    {view === "stored" ? (
+                      <span className="font-mono text-[0.7rem] break-all text-mist">
+                        {item.stored?.ciphertext ?? "not recorded"}
+                      </span>
+                    ) : (
+                      item.text
+                    )}
+                  </button>
                 )}
+
+                {openRecordId === item.id && <MessageRecord message={item} />}
               </div>
             )
           )}

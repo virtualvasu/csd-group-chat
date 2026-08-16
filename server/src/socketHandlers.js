@@ -1,12 +1,37 @@
 const { validateUsername, validateMessage } = require('./validation');
 const { saveMessage, getHistory } = require('./db/messageRepository');
 const { findSender, registerSender } = require('./db/senderRepository');
-const { verifySignature, isTimestampFresh } = require('./crypto/signatures');
+const {
+  verifyBytes,
+  verifySignature,
+  isTimestampFresh,
+  createChallenge,
+} = require('./crypto/signatures');
 const { encrypt, decrypt } = require('./crypto/messageCipher');
 
 // There is only one room for now. Every message is stored against this id, so
 // adding more rooms later is a matter of passing a real id through.
 const ROOM_ID = 'main';
+
+// How long a login challenge stays usable. Long enough for a slow browser to
+// sign it, short enough that a captured challenge is worthless later.
+const CHALLENGE_TTL_MS = 30_000;
+
+// The stored bytes of one message, base64-encoded for the wire.
+//
+// This is what the database actually holds. Clients render it in their
+// encrypted view, which is how someone reading the UI can satisfy themselves
+// that messages are not stored as plaintext without opening a mongo shell.
+// Nothing here is secret: the ciphertext is useless without the server key,
+// and the signature and public key are already broadcast with every message.
+function storedForm(message) {
+  return {
+    ciphertext: message.ciphertext ? message.ciphertext.toString('base64') : null,
+    nonce: message.nonce ? message.nonce.toString('base64') : null,
+    signature: message.signature ? message.signature.toString('base64') : null,
+    clientTimestamp: message.clientTimestamp ?? null,
+  };
+}
 
 // Re-checks the ECDSA signature on one already-decrypted stored message.
 //
@@ -83,6 +108,10 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
           senderPublicKey: message.senderPublicKey
             ? message.senderPublicKey.toString('base64')
             : null,
+          // The stored record exactly as the database holds it. The client
+          // shows this in its encrypted view, so what someone inspects is the
+          // real row rather than a re-encryption made for display.
+          stored: storedForm(message),
         };
 
         let text;
@@ -99,21 +128,27 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
     );
   }
 
+  // Logging in takes two round trips, because presenting a public key proves
+  // nothing on its own — every message broadcast carries the sender's public
+  // key, so anyone can read one off the wire and claim it. What we need is
+  // proof the client holds the matching *private* key, so the server sends a
+  // random challenge and only accepts a signature over it.
+  //
+  //   client  --auth-start {username, publicKey}-->  server
+  //   client  <--auth-challenge {challenge}--------  server
+  //   client  --auth-response {signature}--------->  server
+  //   client  <--join-success ---------------------  server
+  //
+  // The username is bound to its key on first use, so a later login for that
+  // name is rejected unless it presents the same key and can sign with it.
   socket.on(
-    'join',
+    'auth-start',
     safeHandler(async (rawPayload) => {
-      if (socket.data.username) return; // already joined
+      if (socket.data.username) return; // already logged in
 
-      // Accept both new shape { username, publicKey } and legacy bare string.
-      let rawUsername;
-      let publicKey = null;
-
-      if (rawPayload && typeof rawPayload === 'object') {
-        rawUsername = rawPayload.username;
-        publicKey = typeof rawPayload.publicKey === 'string' ? rawPayload.publicKey : null;
-      } else {
-        rawUsername = rawPayload; // bare string — backward compat
-      }
+      const rawUsername = rawPayload && typeof rawPayload === 'object' ? rawPayload.username : null;
+      const publicKey =
+        rawPayload && typeof rawPayload.publicKey === 'string' ? rawPayload.publicKey : null;
 
       const result = validateUsername(rawUsername);
       if (!result.valid) {
@@ -121,41 +156,100 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         return;
       }
 
-      // Trust-on-first-use identity check.
-      // Only enforced when the client sends a public key.
-      if (publicKey) {
-        const existing = await findSender(result.username);
-        if (existing && existing.publicKey !== publicKey) {
-          socket.emit('join-error', {
-            message: 'This username is registered to a different key. Clear your stored identity or choose a different username.',
-          });
-          return;
-        }
+      // No key means the client could not reach WebCrypto at all, which is
+      // usually a page served over plain HTTP from something other than
+      // localhost. Saying so is more useful than a generic refusal.
+      if (!publicKey) {
+        socket.emit('join-error', {
+          message:
+            'This page could not create a signing key. Open the app over HTTPS or on localhost and try again.',
+        });
+        return;
+      }
+
+      // Trust on first use: once a name has a key, only that key may use it.
+      // Checked here as well as after the proof so an impostor is turned away
+      // before the server spends anything on a challenge.
+      const existing = await findSender(result.username);
+      if (existing && existing.publicKey !== publicKey) {
+        socket.emit('join-error', {
+          message:
+            'This username is registered to a different key. Clear your stored identity or choose a different username.',
+        });
+        return;
+      }
+
+      const challenge = createChallenge();
+      socket.data.pendingAuth = {
+        username: result.username,
+        publicKey,
+        challenge,
+        expiresAt: Date.now() + CHALLENGE_TTL_MS,
+      };
+
+      socket.emit('auth-challenge', { challenge });
+    })
+  );
+
+  socket.on(
+    'auth-response',
+    safeHandler(async (rawPayload) => {
+      if (socket.data.username) return; // already logged in
+
+      const pending = socket.data.pendingAuth;
+      if (!pending) {
+        socket.emit('join-error', { message: 'No login in progress. Please try again.' });
+        return;
+      }
+
+      // One challenge, one attempt. Clearing it up front means a failed proof
+      // cannot be retried against the same random bytes.
+      socket.data.pendingAuth = null;
+
+      if (Date.now() > pending.expiresAt) {
+        socket.emit('join-error', { message: 'Login timed out. Please try again.' });
+        return;
+      }
+
+      const signature =
+        rawPayload && typeof rawPayload.signature === 'string' ? rawPayload.signature : null;
+
+      const proved =
+        signature !== null &&
+        (await verifyBytes(
+          Buffer.from(pending.challenge, 'base64'),
+          signature,
+          pending.publicKey
+        ));
+
+      if (!proved) {
+        socket.emit('join-error', {
+          message: 'Could not verify that you hold the private key for this username.',
+        });
+        return;
       }
 
       // Usernames are unique per server, so a second tab using the same name
       // is rejected here as well. A reconnecting client may briefly collide with
       // a recently disconnected socket, so allow a short reclaim window for that case.
-      if (presence.isUsernameTaken(result.username)) {
-        const reclaimed = presence.reclaimUsername(socket.id, result.username);
+      if (presence.isUsernameTaken(pending.username)) {
+        const reclaimed = presence.reclaimUsername(socket.id, pending.username);
         if (!reclaimed) {
           socket.emit('join-error', {
-            message: `Username "${result.username}" is already taken. It may be open in another tab.`,
+            message: `Username "${pending.username}" is already taken. It may be open in another tab.`,
           });
           return;
         }
       }
 
-      presence.add(socket.id, result.username);
-      socket.data.username = result.username;
-      socket.data.publicKey = publicKey; // may be null for legacy clients
+      presence.add(socket.id, pending.username);
+      socket.data.username = pending.username;
+      socket.data.publicKey = pending.publicKey;
 
-      // Record the public key the first time this username joins.
-      if (publicKey) {
-        await registerSender(result.username, publicKey);
-      }
+      // Record the public key the first time this username logs in.
+      await registerSender(pending.username, pending.publicKey);
 
-      socket.emit('join-success', { username: result.username });
+      socket.emit('join-success', { username: pending.username });
 
       // Send the earlier messages before announcing the join, so the new user
       // sees the conversation in order rather than their own join line first.
@@ -169,7 +263,7 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         socket.emit('server-error', { message: 'Could not load earlier messages.' });
       }
 
-      socket.broadcast.emit('user-joined', { username: result.username, timestamp: Date.now() });
+      socket.broadcast.emit('user-joined', { username: pending.username, timestamp: Date.now() });
       io.emit('online-users', presence.list());
     })
   );
@@ -188,20 +282,25 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         return;
       }
 
-      // Accept both new shape { text, timestamp, signature } and legacy bare string.
-      let rawText;
-      let clientTimestamp = null;
-      let signatureB64 = null;
-
-      if (rawPayload && typeof rawPayload === 'object') {
-        rawText = rawPayload.text;
-        clientTimestamp = typeof rawPayload.timestamp === 'number' ? rawPayload.timestamp : null;
-        signatureB64 = typeof rawPayload.signature === 'string' ? rawPayload.signature : null;
-      } else {
-        rawText = rawPayload; // bare string — backward compat, treated as unsigned
+      // Every message must arrive signed. There is no unsigned path: a message
+      // the server cannot attribute to a key is refused rather than stored with
+      // a weaker verdict, so "who wrote this" has an answer for every row in
+      // the database.
+      //
+      // A bare string is what the old unsigned client sent, so it is turned
+      // away here rather than falling through to the text validator, which
+      // would blame the text for a problem that is really a missing signature.
+      if (!rawPayload || typeof rawPayload !== 'object') {
+        socket.emit('message-error', { message: 'Unsigned messages are not accepted.' });
+        return;
       }
 
-      const result = validateMessage(rawText);
+      const clientTimestamp =
+        typeof rawPayload.timestamp === 'number' ? rawPayload.timestamp : null;
+      const signatureB64 =
+        typeof rawPayload.signature === 'string' ? rawPayload.signature : null;
+
+      const result = validateMessage(rawPayload.text);
       if (!result.valid) {
         socket.emit('message-error', { message: result.reason });
         return;
@@ -209,32 +308,30 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
 
       const publicKey = socket.data.publicKey ?? null;
 
-      // Signature handling.
-      let signatureStatus = 'unsigned';
+      if (!publicKey || !signatureB64 || clientTimestamp === null) {
+        socket.emit('message-error', { message: 'Unsigned messages are not accepted.' });
+        return;
+      }
 
-      if (publicKey && signatureB64 && clientTimestamp !== null) {
-        // Anti-replay: reject timestamps that are too far from server time.
-        if (!isTimestampFresh(clientTimestamp)) {
-          socket.emit('message-error', {
-            message: 'Message timestamp is too far from server time. Please check your clock.',
-          });
-          return;
-        }
+      // Anti-replay: reject timestamps that are too far from server time.
+      if (!isTimestampFresh(clientTimestamp)) {
+        socket.emit('message-error', {
+          message: 'Message timestamp is too far from server time. Please check your clock.',
+        });
+        return;
+      }
 
-        const valid = await verifySignature(
-          username,
-          clientTimestamp,
-          result.text,
-          signatureB64,
-          publicKey
-        );
+      const valid = await verifySignature(
+        username,
+        clientTimestamp,
+        result.text,
+        signatureB64,
+        publicKey
+      );
 
-        if (!valid) {
-          socket.emit('message-error', { message: 'Signature verification failed. Message rejected.' });
-          return;
-        }
-
-        signatureStatus = 'valid';
+      if (!valid) {
+        socket.emit('message-error', { message: 'Signature verification failed. Message rejected.' });
+        return;
       }
 
       // Store first, then send it out. That way anything a client receives is
@@ -250,6 +347,7 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       // — without it, no stored signature could ever be re-verified.
       const serverTimestamp = new Date();
       const { ciphertext, nonce } = encrypt(result.text);
+      const signature = Buffer.from(signatureB64, 'base64');
 
       const id = await saveMessage({
         roomId: ROOM_ID,
@@ -257,9 +355,9 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         ciphertext,
         nonce,
         timestamp: serverTimestamp,
-        clientTimestamp: clientTimestamp ?? serverTimestamp.getTime(),
-        signature: signatureB64 ? Buffer.from(signatureB64, 'base64') : null,
-        senderPublicKey: publicKey ? Buffer.from(publicKey, 'base64') : null,
+        clientTimestamp,
+        signature,
+        senderPublicKey: Buffer.from(publicKey, 'base64'),
       });
 
       io.emit('chat-message', {
@@ -267,8 +365,11 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         username,
         text: result.text,
         timestamp: serverTimestamp.getTime(),
-        signature: signatureStatus,
+        signature: 'valid',
         senderPublicKey: publicKey,
+        // Same shape history sends, so a live message and a reloaded one are
+        // interchangeable to the client's encrypted view.
+        stored: storedForm({ ciphertext, nonce, signature, clientTimestamp }),
       });
     })
   );

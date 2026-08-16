@@ -14,6 +14,9 @@ function App() {
     join,
     sendMessage,
     setTyping,
+    publicKey,
+    signingAvailable,
+    historyCount,
   } = useChatSocket();
 
   return (
@@ -25,11 +28,17 @@ function App() {
           onlineUsers={onlineUsers}
           typingUsers={typingUsers}
           timeline={timeline}
+          historyCount={historyCount}
           onSend={sendMessage}
           onTyping={setTyping}
         />
       ) : (
-        <JoinScreen error={joinError} onJoin={join} />
+        <JoinScreen
+          error={joinError}
+          publicKey={publicKey}
+          signingAvailable={signingAvailable}
+          onJoin={join}
+        />
       )}
     </div>
   );

@@ -155,24 +155,44 @@ Liveness check. Returns:
 
 | Event | Payload | Behavior |
 |---|---|---|
-| `join` | `{ username: string, publicKey: string } \| string` | Validates and registers the username. New shape carries the sender's SPKI public key (base64). A bare string is accepted for backward compatibility with stale tabs — those sockets can still join, but messages they send will be marked `unsigned`. Emits `join-success`, then `chat-history`, back to the sender. Emits `join-error` if the name is invalid, taken, or if the supplied key differs from the one already registered for that username (TOFU). Ignored if the socket has already joined. |
-| `chat-message` | `{ text: string, timestamp: number, signature: string } \| string` | Requires a prior successful `join`. New shape includes the client-side ECDSA signature (base64) over the canonical payload and the client's claimed timestamp. A bare string is accepted for backward compatibility — treated as unsigned. Subject to rate limiting (5 messages / 3s per socket) and length/emptiness validation. Anti-replay: rejects a `timestamp` more than 60 s from the server clock. Emits `message-error` back to the sender on rejection. The message is **never stored** if the signature is invalid. |
-| `typing` | `isTyping: boolean` | Requires a prior successful `join`. Relays the sender's typing state to the other clients as `user-typing`. Ignored (silently) if the socket has not joined. |
+| `auth-start` | `{ username: string, publicKey: string }` | Step one of login. Validates the username and the SPKI public key (base64). Replies with `auth-challenge`. Emits `join-error` if the name is invalid, if no key was supplied, or if the key differs from the one already registered for that username (TOFU). Ignored if the socket is already logged in. |
+| `auth-response` | `{ signature: string }` | Step two of login: an ECDSA signature (base64) over the raw bytes of the challenge. On success emits `join-success`, then `chat-history`. Emits `join-error` if there is no login in progress, if the challenge has expired (30 s), if the signature does not verify, or if the username is already online in another tab. The challenge is single-use — a failed attempt must start over from `auth-start`. |
+| `chat-message` | `{ text: string, timestamp: number, signature: string }` | Requires a completed login. Carries the client's ECDSA signature (base64) over the canonical payload and its claimed timestamp. **Unsigned messages are refused** — a bare string, a missing signature, or a missing timestamp all get `message-error`. Subject to rate limiting (5 messages / 3s per socket) and length/emptiness validation. Anti-replay: rejects a `timestamp` more than 60 s from the server clock. The message is **never stored** if the signature is invalid. |
+| `typing` | `isTyping: boolean` | Requires a completed login. Relays the sender's typing state to the other clients as `user-typing`. Ignored (silently) if the socket has not logged in. |
 
 ### Server → Client
 
 | Event | Payload | Sent to |
 |---|---|---|
+| `auth-challenge` | `{ challenge }` | The logging-in socket only. Base64 of 32 random bytes, valid for 30 s and usable once. |
 | `join-success` | `{ username }` | The joining socket only |
-| `join-error` | `{ message }` | The joining socket only (invalid username, duplicate username, TOFU key mismatch) |
-| `message-error` | `{ message }` | The sending socket only (not joined, rate-limited, invalid text, bad signature, stale timestamp) |
+| `join-error` | `{ message }` | The joining socket only (invalid username, missing key, duplicate username, TOFU key mismatch, failed or expired challenge) |
+| `message-error` | `{ message }` | The sending socket only (not joined, rate-limited, invalid text, unsigned, bad signature, stale timestamp) |
 | `server-error` | `{ message }` | The socket that triggered an unexpected server-side error |
 | `user-joined` | `{ username, timestamp }` | Everyone except the joining socket |
 | `user-left` | `{ username, timestamp }` | Everyone except the disconnecting socket |
 | `user-typing` | `{ username, isTyping }` | Everyone except the typing socket |
 | `online-users` | `string[]` | Everyone, after any join/leave |
-| `chat-history` | `{ id, username, text, timestamp, signature, senderPublicKey, integrity? }[]` | The joining socket only, right after `join-success` |
-| `chat-message` | `{ id, username, text, timestamp, signature, senderPublicKey }` | Everyone, including the sender |
+| `chat-history` | `{ id, username, text, timestamp, signature, senderPublicKey, stored, integrity? }[]` | The joining socket only, right after `join-success` |
+| `chat-message` | `{ id, username, text, timestamp, signature, senderPublicKey, stored }` | Everyone, including the sender |
+
+### Why login takes two round trips
+
+A public key is not a secret — it is broadcast with every message its owner
+sends, as `senderPublicKey`. So presenting one proves nothing: anyone who has
+seen a message can replay that key and claim the username. The challenge exists
+so the server checks for possession of the *private* key instead. Signing 32
+random bytes is something only the key holder can do, and the challenge is
+single-use so a captured exchange cannot be replayed.
+
+### The `stored` field
+
+`stored` is `{ ciphertext, nonce, signature, clientTimestamp }`, all base64
+except the timestamp, and it is the row as the database holds it. Clients render
+it in their "stored bytes" view so that "messages are not stored as plaintext"
+is something a reader can check for themselves rather than take on trust.
+Nothing in it is secret: the ciphertext is useless without the server's key, and
+the signature and public key already travel with every message.
 
 `integrity` appears in `chat-history` only, and only on a message whose stored
 copy failed its authentication check. It is then `'failed'` and `text` is `null`,

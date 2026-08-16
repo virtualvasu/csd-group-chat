@@ -6,7 +6,12 @@ import type {
   StoredItem,
   TimelineItem,
 } from "@/types";
-import { getOrCreateIdentity, exportPublicKey, sign } from "@/lib/identity";
+import {
+  exportPublicKey,
+  sign,
+  isSigningAvailable,
+  decodeBase64,
+} from "@/lib/identity";
 import { buildCanonicalBytes } from "@/lib/canonical";
 
 const TYPING_IDLE_MS = 2000;
@@ -44,6 +49,12 @@ export function useChatSocket() {
   const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
   const [items, setItems] = useState<StoredItem[]>([]);
+  const [publicKey, setPublicKey] = useState<string | null>(null);
+  const [historyCount, setHistoryCount] = useState(0);
+
+  // Checked once: it depends on how the page was served, not on anything that
+  // changes while it is open.
+  const [signingAvailable] = useState(isSigningAvailable);
 
   const timeline = useMemo(() => buildTimeline(items), [items]);
 
@@ -59,30 +70,32 @@ export function useChatSocket() {
     socketRef.current = socket;
 
     // Start loading the identity eagerly so it is ready by the time the user
-    // clicks "Join". Errors here are non-fatal — the join will still work but
-    // messages will be sent unsigned.
-    getOrCreateIdentity().catch(() => {});
-
-    async function emitJoin(name: string) {
-      let publicKey: string | null = null;
-      try {
-        publicKey = await exportPublicKey();
-      } catch {
-        // Identity unavailable: fall back to unsigned join (server allows it).
-      }
-      socket.emit("join", publicKey ? { username: name, publicKey } : name);
+    // clicks "Join", and surface the public key so the UI can show which
+    // identity this browser is about to log in as.
+    if (signingAvailable) {
+      exportPublicKey()
+        .then(setPublicKey)
+        .catch(() => {});
     }
 
-    function scheduleReconnectJoin() {
+    // Step one of the login: name the account and present the public key. The
+    // server answers with a challenge rather than letting us straight in,
+    // because a public key is not a secret.
+    async function startAuth(name: string) {
+      const key = await exportPublicKey();
+      socket.emit("auth-start", { username: name, publicKey: key });
+    }
+
+    function scheduleReconnectAuth() {
       if (!hasJoinedRef.current || !usernameRef.current) return;
       setTimeout(() => {
         if (socket.connected && hasJoinedRef.current && usernameRef.current) {
-          emitJoin(usernameRef.current);
+          startAuth(usernameRef.current).catch(() => {});
         }
       }, 250);
     }
 
-    function toChatItem(message: ServerMessage): StoredItem {
+    function toChatItem(message: ServerMessage, fromHistory: boolean): StoredItem {
       return {
         kind: "chat",
         id: message.id,
@@ -93,12 +106,25 @@ export function useChatSocket() {
         signature: message.signature ?? "unsigned",
         senderPublicKey: message.senderPublicKey ?? null,
         integrity: message.integrity,
+        stored: message.stored ?? null,
+        fromHistory,
       };
     }
 
+    // Step two: prove we hold the private key by signing the challenge bytes.
+    socket.on("auth-challenge", ({ challenge }: { challenge: string }) => {
+      sign(decodeBase64(challenge))
+        .then((signature) => socket.emit("auth-response", { signature }))
+        .catch(() => {
+          setJoinError(
+            "This browser could not sign the login challenge. Open the app over HTTPS or on localhost."
+          );
+        });
+    });
+
     socket.on("connect", () => {
       setConnectionStatus("connected");
-      scheduleReconnectJoin();
+      scheduleReconnectAuth();
     });
 
     socket.on("disconnect", () => {
@@ -111,7 +137,7 @@ export function useChatSocket() {
     socket.io.on("reconnect_attempt", () => setConnectionStatus("reconnecting"));
     socket.io.on("reconnect", () => {
       setConnectionStatus("connected");
-      scheduleReconnectJoin();
+      scheduleReconnectAuth();
     });
 
     socket.on("join-success", ({ username: confirmed }) => {
@@ -168,13 +194,14 @@ export function useChatSocket() {
     socket.on("chat-history", (history: ServerMessage[]) => {
       if (!Array.isArray(history) || history.length === 0) return;
 
+      setHistoryCount(history.length);
       setItems((prev) => {
         const known = new Set(
           prev.filter((item) => item.kind === "chat").map((item) => item.id)
         );
         const missing = history
           .filter((message) => !known.has(message.id))
-          .map(toChatItem);
+          .map((message) => toChatItem(message, true));
 
         return missing.length === 0 ? prev : [...prev, ...missing];
       });
@@ -189,7 +216,7 @@ export function useChatSocket() {
           return prev;
         }
 
-        return [...prev, toChatItem(message)];
+        return [...prev, toChatItem(message, false)];
       });
     });
 
@@ -199,19 +226,27 @@ export function useChatSocket() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Kicks off the login. The rest of the handshake — challenge in, signature
+  // out — is handled by the socket listeners set up above.
   const join = useCallback((value: string) => {
     const trimmed = value.trim();
     if (!trimmed) return;
+
     setJoinError("");
-    // Emit the keyed join payload; the effect's emitJoin is not in scope here
-    // so we re-do the logic inline.
+
+    if (!isSigningAvailable()) {
+      setJoinError(
+        "This page cannot create a signing key. Open the app over HTTPS or on localhost."
+      );
+      return;
+    }
+
     exportPublicKey()
-      .then((publicKey) => {
-        socketRef.current?.emit("join", { username: trimmed, publicKey });
+      .then((key) => {
+        socketRef.current?.emit("auth-start", { username: trimmed, publicKey: key });
       })
       .catch(() => {
-        // Fall back to bare string if identity is unavailable.
-        socketRef.current?.emit("join", trimmed);
+        setJoinError("Could not load this browser's signing key. Try reloading the page.");
       });
   }, []);
 
@@ -234,21 +269,18 @@ export function useChatSocket() {
 
       const timestamp = Date.now();
 
-      let signature: string | null = null;
+      // Sending unsigned is not an option any more — the server would refuse
+      // it — so a signing failure is reported here rather than swallowed.
       try {
         const canonical = buildCanonicalBytes(usernameRef.current, timestamp, trimmed);
-        signature = await sign(canonical);
-      } catch {
-        // Sign failed: send unsigned (server will mark it 'unsigned').
-      }
+        const signature = await sign(canonical);
 
-      if (signature) {
         socketRef.current?.emit("chat-message", { text: trimmed, timestamp, signature });
-      } else {
-        socketRef.current?.emit("chat-message", trimmed);
+      } catch {
+        pushSystem("Message not sent: this browser could not sign it.");
       }
     },
-    [setTyping]
+    [setTyping, pushSystem]
   );
 
   return {
@@ -262,5 +294,11 @@ export function useChatSocket() {
     join,
     sendMessage,
     setTyping,
+    /** This browser's base64 public key, once the identity has loaded. */
+    publicKey,
+    /** False when the page has no WebCrypto, so no login is possible. */
+    signingAvailable,
+    /** How many messages the server replayed from the database on login. */
+    historyCount,
   };
 }
