@@ -13,6 +13,7 @@ const DEFAULT_HISTORY_LIMIT = 100;
 //   signature        Binary    null for now, used once messages are signed
 //   senderPublicKey  Binary    null for now, used once messages are signed
 //   timestamp        Date      when the server accepted the message
+//   clientTimestamp  number    client-claimed timestamp (ms); used to re-verify signatures on history load
 //
 // This file stores and returns those bytes as they are. Encrypting and
 // decrypting them is the caller's job, so the queries stay independent of how
@@ -34,6 +35,7 @@ async function saveMessage({
   signature = null,
   senderPublicKey = null,
   timestamp = new Date(),
+  clientTimestamp = null,
 }) {
   const result = await collection().insertOne({
     roomId,
@@ -43,6 +45,7 @@ async function saveMessage({
     signature,
     senderPublicKey,
     timestamp,
+    clientTimestamp: clientTimestamp ?? timestamp.getTime(),
   });
 
   return result.insertedId.toHexString();
@@ -74,6 +77,7 @@ async function getHistory(roomId, limit = DEFAULT_HISTORY_LIMIT) {
     signature: toBuffer(doc.signature),
     senderPublicKey: toBuffer(doc.senderPublicKey),
     timestamp: doc.timestamp,
+    clientTimestamp: doc.clientTimestamp ?? null,
   }));
 }
 

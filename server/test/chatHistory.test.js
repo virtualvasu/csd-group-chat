@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { webcrypto } = require('node:crypto');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const { io } = require('socket.io-client');
@@ -9,6 +10,7 @@ const { RateLimiter } = require('../src/rateLimiter');
 const { registerSocketHandlers } = require('../src/socketHandlers');
 const database = require('../src/db');
 const { COLLECTION, toBuffer } = require('../src/db/messageRepository');
+const { buildCanonicalBytes } = require('../src/crypto/canonical');
 const { connectTestDb, clearTestDb, closeTestDb, skipReason } = require('./helpers/testDb');
 const { useTestEncryptionKey } = require('./helpers/testKey');
 
@@ -49,12 +51,52 @@ async function send(socket, texts) {
 }
 
 // Joins the chat and returns the history the server sent on the way in.
-async function joinAs(socket, username) {
+async function joinAs(socket, username, publicKey = null) {
   const historyPromise = waitForEvent(socket, 'chat-history');
-  socket.emit('join', username);
+  socket.emit('join', publicKey ? { username, publicKey } : username);
   await waitForEvent(socket, 'join-success');
 
   return historyPromise;
+}
+
+// Stands in for a browser holding an ECDSA identity, so these tests can send
+// messages that are signed the way a real client signs them.
+async function createIdentity() {
+  const pair = await webcrypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+
+  const spki = Buffer.from(await webcrypto.subtle.exportKey('spki', pair.publicKey));
+
+  return {
+    publicKey: spki.toString('base64'),
+    async sign(username, timestamp, text) {
+      const signature = await webcrypto.subtle.sign(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        pair.privateKey,
+        buildCanonicalBytes(username, timestamp, text)
+      );
+
+      return Buffer.from(signature).toString('base64');
+    },
+  };
+}
+
+// Sends one signed message and resolves once the server has broadcast it,
+// which is also when it is safely stored.
+async function sendSigned(socket, identity, username, text) {
+  const timestamp = Date.now();
+  const broadcast = waitForEvent(socket, 'chat-message');
+
+  socket.emit('chat-message', {
+    text,
+    timestamp,
+    signature: await identity.sign(username, timestamp, text),
+  });
+
+  return broadcast;
 }
 
 test.before(async () => {
@@ -238,6 +280,109 @@ test('a tampered message is flagged and the others still load', { skip }, async 
     assert.equal(history[1].text, null);
     assert.equal(history[1].integrity, 'failed');
     assert.equal(history[1].username, 'Asha');
+  } finally {
+    second.disconnect();
+  }
+});
+
+// The next three cover the seam between the two features: messages are stored
+// encrypted, but the signature is over the plaintext, so history has to decrypt
+// before it can verify. Getting that order wrong makes every signature look
+// invalid, which is why each verdict is pinned down separately here.
+
+test('a signature still verifies after a round trip through storage', { skip }, async () => {
+  const identity = await createIdentity();
+  const first = connectClient();
+
+  try {
+    await waitForEvent(first, 'connect');
+    await joinAs(first, 'Asha', identity.publicKey);
+    await sendSigned(first, identity, 'Asha', 'signed and stored');
+  } finally {
+    first.disconnect();
+  }
+
+  const second = connectClient();
+
+  try {
+    await waitForEvent(second, 'connect');
+    const history = await joinAs(second, 'Kunal');
+
+    assert.equal(history.length, 1);
+    assert.equal(history[0].text, 'signed and stored');
+    assert.equal(history[0].signature, 'valid');
+    assert.equal(history[0].integrity, undefined);
+    assert.equal(history[0].senderPublicKey, identity.publicKey);
+  } finally {
+    second.disconnect();
+  }
+});
+
+test('editing a stored signature is caught but leaves the text readable', { skip }, async () => {
+  const identity = await createIdentity();
+  const first = connectClient();
+
+  try {
+    await waitForEvent(first, 'connect');
+    await joinAs(first, 'Asha', identity.publicKey);
+    await sendSigned(first, identity, 'Asha', 'who really sent this');
+  } finally {
+    first.disconnect();
+  }
+
+  // Only the signature is touched, so the ciphertext still decrypts cleanly.
+  const messages = database.getDb().collection(COLLECTION);
+  const latest = await messages.findOne({}, { sort: { _id: -1 } });
+  const forged = toBuffer(latest.signature);
+  forged[0] ^= 0x01;
+  await messages.updateOne({ _id: latest._id }, { $set: { signature: forged } });
+
+  const second = connectClient();
+
+  try {
+    await waitForEvent(second, 'connect');
+    const history = await joinAs(second, 'Kunal');
+
+    // The message is readable and its bytes are intact, so integrity passes.
+    // What failed is the claim about who wrote it.
+    assert.equal(history[0].text, 'who really sent this');
+    assert.equal(history[0].integrity, undefined);
+    assert.equal(history[0].signature, 'invalid');
+  } finally {
+    second.disconnect();
+  }
+});
+
+test('a message that will not decrypt is not blamed on its sender', { skip }, async () => {
+  const identity = await createIdentity();
+  const first = connectClient();
+
+  try {
+    await waitForEvent(first, 'connect');
+    await joinAs(first, 'Asha', identity.publicKey);
+    await sendSigned(first, identity, 'Asha', 'bytes about to be broken');
+  } finally {
+    first.disconnect();
+  }
+
+  const messages = database.getDb().collection(COLLECTION);
+  const latest = await messages.findOne({}, { sort: { _id: -1 } });
+  const tampered = toBuffer(latest.ciphertext);
+  tampered[0] ^= 0x01;
+  await messages.updateOne({ _id: latest._id }, { $set: { ciphertext: tampered } });
+
+  const second = connectClient();
+
+  try {
+    await waitForEvent(second, 'connect');
+    const history = await joinAs(second, 'Kunal');
+
+    assert.equal(history[0].text, null);
+    assert.equal(history[0].integrity, 'failed');
+    // Not 'invalid'. There is no plaintext left to check the signature over, so
+    // saying the signature failed would accuse the sender of something the
+    // server cannot actually tell.
+    assert.equal(history[0].signature, 'unknown');
   } finally {
     second.disconnect();
   }

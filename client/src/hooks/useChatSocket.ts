@@ -6,6 +6,8 @@ import type {
   StoredItem,
   TimelineItem,
 } from "@/types";
+import { getOrCreateIdentity, exportPublicKey, sign } from "@/lib/identity";
+import { buildCanonicalBytes } from "@/lib/canonical";
 
 const TYPING_IDLE_MS = 2000;
 let seq = 0;
@@ -56,11 +58,26 @@ export function useChatSocket() {
     const socket = io({ reconnectionDelay: 500, reconnectionDelayMax: 3000 });
     socketRef.current = socket;
 
+    // Start loading the identity eagerly so it is ready by the time the user
+    // clicks "Join". Errors here are non-fatal — the join will still work but
+    // messages will be sent unsigned.
+    getOrCreateIdentity().catch(() => {});
+
+    async function emitJoin(name: string) {
+      let publicKey: string | null = null;
+      try {
+        publicKey = await exportPublicKey();
+      } catch {
+        // Identity unavailable: fall back to unsigned join (server allows it).
+      }
+      socket.emit("join", publicKey ? { username: name, publicKey } : name);
+    }
+
     function scheduleReconnectJoin() {
       if (!hasJoinedRef.current || !usernameRef.current) return;
       setTimeout(() => {
         if (socket.connected && hasJoinedRef.current && usernameRef.current) {
-          socket.emit("join", usernameRef.current);
+          emitJoin(usernameRef.current);
         }
       }, 250);
     }
@@ -73,6 +90,8 @@ export function useChatSocket() {
         text: message.text,
         timestamp: message.timestamp,
         own: message.username === usernameRef.current,
+        signature: message.signature ?? "unsigned",
+        senderPublicKey: message.senderPublicKey ?? null,
         integrity: message.integrity,
       };
     }
@@ -184,7 +203,16 @@ export function useChatSocket() {
     const trimmed = value.trim();
     if (!trimmed) return;
     setJoinError("");
-    socketRef.current?.emit("join", trimmed);
+    // Emit the keyed join payload; the effect's emitJoin is not in scope here
+    // so we re-do the logic inline.
+    exportPublicKey()
+      .then((publicKey) => {
+        socketRef.current?.emit("join", { username: trimmed, publicKey });
+      })
+      .catch(() => {
+        // Fall back to bare string if identity is unavailable.
+        socketRef.current?.emit("join", trimmed);
+      });
   }, []);
 
   const setTyping = useCallback((typing: boolean) => {
@@ -198,11 +226,27 @@ export function useChatSocket() {
   }, []);
 
   const sendMessage = useCallback(
-    (text: string) => {
+    async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
-      socketRef.current?.emit("chat-message", trimmed);
+
       setTyping(false);
+
+      const timestamp = Date.now();
+
+      let signature: string | null = null;
+      try {
+        const canonical = buildCanonicalBytes(usernameRef.current, timestamp, trimmed);
+        signature = await sign(canonical);
+      } catch {
+        // Sign failed: send unsigned (server will mark it 'unsigned').
+      }
+
+      if (signature) {
+        socketRef.current?.emit("chat-message", { text: trimmed, timestamp, signature });
+      } else {
+        socketRef.current?.emit("chat-message", trimmed);
+      }
     },
     [setTyping]
   );
