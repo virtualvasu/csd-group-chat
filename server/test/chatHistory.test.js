@@ -44,7 +44,7 @@ async function joinAs(socket, username) {
 test.before(async () => {
   if (skip) return;
 
-  await connectTestDb();
+  await connectTestDb('history');
 
   const app = createServer();
   ioServer = new Server(app, { transports: ['websocket'] });

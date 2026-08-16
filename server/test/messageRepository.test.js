@@ -32,7 +32,7 @@ function textsOf(history) {
 
 test.before(async () => {
   if (skip) return;
-  await connectTestDb();
+  await connectTestDb('repository');
 });
 
 test.beforeEach(async () => {

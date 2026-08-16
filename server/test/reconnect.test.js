@@ -30,7 +30,7 @@ function waitForEvent(socket, eventName, timeoutMs = 5000) {
 }
 
 test.before(async () => {
-  if (needsDatabase) await connectTestDb();
+  if (needsDatabase) await connectTestDb('reconnect');
 
   const app = createServer();
   ioServer = new Server(app, { transports: ['websocket'] });
