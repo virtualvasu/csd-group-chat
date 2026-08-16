@@ -17,6 +17,30 @@ const KEY_RECORD_ID = 'main';
 
 const ALGO: EcKeyGenParams = { name: 'ECDSA', namedCurve: 'P-256' };
 
+/**
+ * Whether this page can do any of the crypto below.
+ *
+ * `crypto.subtle` only exists in a secure context — HTTPS, or localhost. A page
+ * served over plain HTTP from a LAN address has no WebCrypto at all, so there
+ * is no identity to be had and the server will refuse the login. Callers check
+ * this so they can say that plainly instead of failing with a TypeError.
+ */
+export function isSigningAvailable(): boolean {
+  return typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
+}
+
+/** Decodes a base64 string into the bytes it represents. */
+export function decodeBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return bytes;
+}
+
 // --------------------------------------------------------------------------
 // IndexedDB helpers
 // --------------------------------------------------------------------------
