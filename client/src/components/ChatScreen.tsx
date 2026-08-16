@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { MessageTrustBadge } from "@/components/MessageTrustBadge";
 import { MessageRecord } from "@/components/MessageRecord";
 import { HistoryPanel } from "@/components/HistoryPanel";
+import { SecurityPanel } from "@/components/SecurityPanel";
 import { cn } from "@/lib/utils";
 import { colorForUser } from "@/lib/userColor";
 import type { ConnectionStatus, TimelineItem } from "@/types";
@@ -101,6 +102,7 @@ export function ChatScreen({
   typingUsers,
   timeline,
   historyCount,
+  publicKey,
   onSend,
   onTyping,
 }: {
@@ -110,6 +112,7 @@ export function ChatScreen({
   typingUsers: string[];
   timeline: TimelineItem[];
   historyCount: number;
+  publicKey: string | null;
   onSend: (text: string) => void;
   onTyping: (typing: boolean) => void;
 }) {
@@ -152,8 +155,8 @@ export function ChatScreen({
 
   return (
     <div className="flex h-full flex-col md:flex-row">
-      <aside className="flex shrink-0 flex-col gap-3 border-b border-hairline bg-linen p-4 md:h-full md:w-56 md:border-b-0 md:border-r">
-        <div className="flex items-center justify-between">
+      <aside className="flex shrink-0 flex-col gap-3 overflow-y-auto border-b border-hairline bg-linen p-4 md:h-full md:w-64 md:border-b-0 md:border-r">
+        <div className="flex items-baseline justify-between gap-2">
           <h2 className="font-display text-base font-medium text-ink">
             Online
           </h2>
@@ -178,6 +181,12 @@ export function ChatScreen({
             </li>
           ))}
         </ul>
+
+        <SecurityPanel
+          username={username}
+          publicKey={publicKey}
+          timeline={timeline}
+        />
       </aside>
 
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-paper">
@@ -194,16 +203,39 @@ export function ChatScreen({
             <span aria-hidden="true"> {showHistory ? "▲" : "▼"}</span>
           </button>
 
-          <ViewToggle view={view} onChange={setView} />
+          <div className="flex items-center gap-3">
+            <span className="hidden text-xs text-mist sm:inline">
+              Click a message to see its stored record
+            </span>
+            <ViewToggle view={view} onChange={setView} />
+          </div>
         </header>
 
         {showHistory && <HistoryPanel timeline={timeline} />}
+
+        {view === "stored" && (
+          <p className="shrink-0 border-b border-hairline bg-linen px-4 py-2 text-xs text-mist md:px-6">
+            Showing the ciphertext each message is stored as. This is what the
+            database holds — the readable text exists only in transit and on
+            screen.
+          </p>
+        )}
 
         <div
           ref={scrollRef}
           onScroll={handleScroll}
           className="flex-1 space-y-1.5 overflow-y-auto px-4 py-4 md:px-6"
         >
+          {timeline.length === 0 && (
+            <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+              <p className="font-display text-lg text-ink">No messages yet</p>
+              <p className="max-w-xs text-sm text-mist">
+                Send one, then reload the page — it will come back from the
+                database, signed and checked.
+              </p>
+            </div>
+          )}
+
           {timeline.map((item) =>
             item.kind === "system" ? (
               <div key={item.id} className="flex justify-center py-1">

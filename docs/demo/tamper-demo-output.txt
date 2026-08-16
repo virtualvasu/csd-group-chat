@@ -1,0 +1,8 @@
+Message  : 6a81f56eec1d58fe5cf101d6
+Sender   : Asha
+Sent at  : 2026-08-16T17:37:50.107Z
+Before   : e07a67356e540c07f3c1660cdb54c8b8...
+After    : e17a67356e540c07f3c1660cdb54c8b8...
+
+One bit of the ciphertext changed. Reload the client: this message is
+flagged as failing integrity verification, the rest load as usual.

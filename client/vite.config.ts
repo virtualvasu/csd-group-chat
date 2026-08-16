@@ -14,6 +14,11 @@ import basicSsl from '@vitejs/plugin-basic-ssl'
 //
 // The certificate is self-signed, so each device has to accept a browser
 // warning once. That is the whole cost of it.
+// Which chat server to proxy to. Overridable so a second instance can be run
+// against a throwaway database — useful for capturing a demo without touching
+// the real room.
+const chatServer = process.env.CHAT_SERVER_URL ?? 'http://localhost:4000'
+
 export default defineConfig({
   plugins: [react(), tailwindcss(), basicSsl()],
   resolve: {
@@ -27,10 +32,10 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/socket.io': {
-        target: 'http://localhost:4000',
+        target: chatServer,
         ws: true,
       },
-      '/health': 'http://localhost:4000',
+      '/health': chatServer,
     },
   },
 })

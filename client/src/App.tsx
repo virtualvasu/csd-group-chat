@@ -29,6 +29,7 @@ function App() {
           typingUsers={typingUsers}
           timeline={timeline}
           historyCount={historyCount}
+          publicKey={publicKey}
           onSend={sendMessage}
           onTyping={setTyping}
         />
