@@ -1,5 +1,6 @@
 const { validateUsername, validateMessage } = require('./validation');
 const { saveMessage, getHistory } = require('./db/messageRepository');
+const { encrypt, decrypt } = require('./crypto/messageCipher');
 
 // There is only one room for now. Every message is stored against this id, so
 // adding more rooms later is a matter of passing a real id through.
@@ -24,15 +25,29 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
   // Reads the stored messages for the room and turns them into the shape the
   // client expects. A database problem here should not stop someone joining,
   // so the caller decides what to do if this throws.
+  //
+  // Each message is decrypted on its own. A document whose bytes no longer
+  // match their authentication tag has been changed since it was written, and
+  // it is reported as such instead of throwing: one tampered message must not
+  // cost everyone else their whole history.
   async function loadHistory() {
     const stored = await getHistory(ROOM_ID);
 
-    return stored.map((message) => ({
-      id: message.id,
-      username: message.senderId,
-      text: message.ciphertext.toString('utf8'),
-      timestamp: message.timestamp.getTime(),
-    }));
+    return stored.map((message) => {
+      const common = {
+        id: message.id,
+        username: message.senderId,
+        timestamp: message.timestamp.getTime(),
+      };
+
+      try {
+        return { ...common, text: decrypt(message) };
+      } catch (err) {
+        console.error(`Message ${message.id} failed integrity verification:`, err.message);
+
+        return { ...common, text: null, integrity: 'failed' };
+      }
+    });
   }
 
   socket.on(
@@ -104,11 +119,17 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       // Store first, then send it out. That way anything a client receives is
       // already saved, and the broadcast can carry the id the message was
       // stored under.
+      //
+      // Only the stored copy is encrypted. The broadcast below still carries
+      // the text, because the requirement here is that the database holds no
+      // readable message, not that clients cannot read what was sent to them.
       const timestamp = new Date();
+      const { ciphertext, nonce } = encrypt(result.text);
       const id = await saveMessage({
         roomId: ROOM_ID,
         senderId: username,
-        ciphertext: Buffer.from(result.text, 'utf8'),
+        ciphertext,
+        nonce,
         timestamp,
       });
 

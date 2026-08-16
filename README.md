@@ -14,6 +14,8 @@ everyone in one shared room.
 - Live online-users list
 - "User is typing..." indicator
 - Graceful handling of client disconnects (tab close, refresh, network drop)
+- Messages encrypted in the database (AES-256-GCM), with edited messages flagged
+  in the chat instead of shown as text
 
 A username can only be online once. Joining from a second tab with a name that
 is already in use is rejected on the join screen; use a different name, or
@@ -39,9 +41,20 @@ Messages are stored in MongoDB Atlas (the free M0 tier is enough for this).
 
    Open `server/.env` and paste the connection string into `MONGODB_URI`,
    replacing `<password>` with the database user's password.
+6. Generate the key used to encrypt stored messages and paste it into the same
+   file:
 
-`server/.env` is ignored by git, so the connection string is never committed.
-Everyone running the server needs their own copy of this file.
+   ```bash
+   npm run generate-key
+   ```
+
+`server/.env` is ignored by git, so neither the connection string nor the
+encryption key is ever committed. Everyone running the server needs their own
+copy of this file.
+
+Everyone sharing one database has to share the same `CHAT_ENCRYPTION_KEY`, since
+messages can only be read with the key they were written under. Generate it once
+and pass it around with the connection string.
 
 ## Running the server
 
@@ -62,9 +75,10 @@ npm install
 npm start
 ```
 
-The server connects to MongoDB before it starts accepting clients. If
-`MONGODB_URI` is missing or wrong, it stops with a message saying so rather
-than starting up and losing messages.
+The server checks the encryption key and connects to MongoDB before it starts
+accepting clients. If `CHAT_ENCRYPTION_KEY` or `MONGODB_URI` is missing or
+wrong, it stops with a message saying so rather than starting up and losing
+messages.
 
 The server starts on `http://localhost:4000` and also serves the built
 frontend (`client/dist`), so there's nothing separate to run for the UI.
@@ -169,7 +183,8 @@ sequenceDiagram
     alt invalid or rate-limited
         S-->>A: message-error
     else valid
-        S->>DB: save message
+        S->>S: encrypt message
+        S->>DB: save encrypted message
         DB-->>S: message id
         S->>A: chat-message (id, text, timestamp)
         S->>B: chat-message (id, text, timestamp)
@@ -221,10 +236,24 @@ History is sent again whenever a client rejoins, including after a reconnect.
 Each message carries the id it was stored under, and the client ignores ids it
 already has, so a brief network drop does not show the conversation twice.
 
+## Encryption at rest
+
+Messages are encrypted with AES-256-GCM before they reach the database and
+decrypted again when history is read, so a look at the collection shows binary
+rather than the conversation. Each message gets its own random nonce, and the
+authentication tag stored alongside it is what makes editing a stored message
+detectable: it no longer decrypts, and the client shows it as failing
+verification rather than showing text nobody sent.
+
+Live messages still travel over the socket as text. The point here is that the
+database holds nothing readable, not that clients cannot read their own chat.
+
+The key lives in `CHAT_ENCRYPTION_KEY` in `server/.env`, and `server/README.md`
+covers the details, including `npm run tamper-demo` for demonstrating the
+detection.
+
 ## Roadmap (post-MVP)
 
-- Encrypt stored messages instead of keeping them readable in the database
-- Detect tampering with stored messages
 - Per-sender signing keys so message authorship can be verified
 - Private (1:1) messaging
 - Improved styling / mobile layout

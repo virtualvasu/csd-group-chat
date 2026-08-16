@@ -7,7 +7,12 @@ const { io } = require('socket.io-client');
 const { Presence } = require('../src/presence');
 const { RateLimiter } = require('../src/rateLimiter');
 const { registerSocketHandlers } = require('../src/socketHandlers');
+const database = require('../src/db');
+const { COLLECTION, toBuffer } = require('../src/db/messageRepository');
 const { connectTestDb, clearTestDb, closeTestDb, skipReason } = require('./helpers/testDb');
+const { useTestEncryptionKey } = require('./helpers/testKey');
+
+useTestEncryptionKey();
 
 const skip = skipReason();
 
@@ -30,6 +35,17 @@ function waitForEvent(socket, eventName, timeoutMs = 5000) {
 
 function connectClient() {
   return io(`http://localhost:${port}`, { transports: ['websocket'], forceNew: true });
+}
+
+// Sends messages one at a time, waiting for each broadcast, so they keep their
+// order and are all stored before the next step of a test runs.
+async function send(socket, texts) {
+  for (const text of texts) {
+    const broadcast = waitForEvent(socket, 'chat-message');
+    socket.emit('chat-message', text);
+    // eslint-disable-next-line no-await-in-loop
+    await broadcast;
+  }
 }
 
 // Joins the chat and returns the history the server sent on the way in.
@@ -103,13 +119,7 @@ test('someone joining later receives the earlier messages', { skip }, async () =
     const emptyHistory = await joinAs(first, 'Asha');
     assert.deepEqual(emptyHistory, []);
 
-    for (const text of ['one', 'two']) {
-      const sent = waitForEvent(first, 'chat-message');
-      first.emit('chat-message', text);
-      // Waited for one at a time so the two messages keep their order.
-      // eslint-disable-next-line no-await-in-loop
-      await sent;
-    }
+    await send(first, ['one', 'two']);
 
     const second = connectClient();
 
@@ -177,5 +187,58 @@ test('messages survive a server restart', { skip }, async () => {
     afterRestart.disconnect();
     restarted.close();
     await new Promise((resolve) => restartedHttp.close(resolve));
+  }
+});
+
+test('a stored message does not hold readable text', { skip }, async () => {
+  const client = connectClient();
+
+  try {
+    await waitForEvent(client, 'connect');
+    await joinAs(client, 'Asha');
+    await send(client, ['meet me at four']);
+  } finally {
+    client.disconnect();
+  }
+
+  const stored = await database.getDb().collection(COLLECTION).findOne({});
+
+  assert.ok(!toBuffer(stored.ciphertext).toString('utf8').includes('meet me at four'));
+  assert.equal(toBuffer(stored.nonce).length, 12);
+});
+
+test('a tampered message is flagged and the others still load', { skip }, async () => {
+  const first = connectClient();
+
+  try {
+    await waitForEvent(first, 'connect');
+    await joinAs(first, 'Asha');
+    await send(first, ['safe one', 'edited one']);
+  } finally {
+    first.disconnect();
+  }
+
+  // Change the stored bytes behind the server's back, the way the tamper demo
+  // script does.
+  const messages = database.getDb().collection(COLLECTION);
+  const latest = await messages.findOne({}, { sort: { _id: -1 } });
+  const tampered = toBuffer(latest.ciphertext);
+  tampered[0] ^= 0x01;
+  await messages.updateOne({ _id: latest._id }, { $set: { ciphertext: tampered } });
+
+  const second = connectClient();
+
+  try {
+    await waitForEvent(second, 'connect');
+    const history = await joinAs(second, 'Kunal');
+
+    assert.equal(history.length, 2);
+    assert.equal(history[0].text, 'safe one');
+    assert.equal(history[0].integrity, undefined);
+    assert.equal(history[1].text, null);
+    assert.equal(history[1].integrity, 'failed');
+    assert.equal(history[1].username, 'Asha');
+  } finally {
+    second.disconnect();
   }
 });

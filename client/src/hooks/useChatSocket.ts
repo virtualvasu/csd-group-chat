@@ -73,6 +73,7 @@ export function useChatSocket() {
         text: message.text,
         timestamp: message.timestamp,
         own: message.username === usernameRef.current,
+        integrity: message.integrity,
       };
     }
 

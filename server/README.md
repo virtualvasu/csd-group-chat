@@ -12,6 +12,10 @@ server/
     routes/health.js          GET /health liveness endpoint
     db/index.js               MongoDB connection lifecycle (connect / getDb / close) and index setup
     db/messageRepository.js    All message queries: saveMessage + getHistory
+    crypto/messageCipher.js     AES-256-GCM encrypt / decrypt and the key loaded at startup
+  scripts/
+    generate-key.js           Prints a fresh CHAT_ENCRYPTION_KEY
+    tamper-demo.js            Flips a bit in the newest stored message, for the tamper-detection demo
 ```
 
 ## Configuration
@@ -22,12 +26,20 @@ so there is no `dotenv` dependency). Copy `.env.example` to `.env` and fill it i
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `MONGODB_URI` | yes | — | MongoDB Atlas connection string |
+| `CHAT_ENCRYPTION_KEY` | yes | — | 32-byte AES key, base64 encoded, used to encrypt stored messages |
 | `MONGODB_DB_NAME` | no | `csd_group_chat` | Database name inside the cluster |
 | `PORT` | no | `4000` | Port the chat server listens on. 3000 is left free for the client dev server |
 
 `MONGODB_URI` deliberately has no default. A default pointing at localhost would
 let the server start and quietly store messages somewhere nobody intended, so a
 missing connection string stops startup with a message explaining what to do.
+
+`CHAT_ENCRYPTION_KEY` has no default either, and for a sharper reason: a key
+invented at boot would encrypt today's messages with something no later run of
+the server has, so every restart would leave the whole history unreadable.
+Generate one with `npm run generate-key` and keep it in `server/.env`. The key is
+checked before the server starts listening, so a missing or wrong-sized key is a
+startup error rather than a surprise on the first message.
 
 ## Storage
 
@@ -38,15 +50,14 @@ Messages live in the `messages` collection:
 | `_id` | ObjectId | Also the message id sent to clients, as a 24-character hex string |
 | `roomId` | string | Always `main` for now |
 | `senderId` | string | The username that sent the message |
-| `ciphertext` | Binary | The message bytes |
-| `nonce` | Binary \| null | Unused for now; reserved for encryption |
+| `ciphertext` | Binary | The encrypted message, with the 16-byte authentication tag on the end |
+| `nonce` | Binary | The 12-byte nonce this message was encrypted with |
 | `signature` | Binary \| null | Unused for now; reserved for message signing |
 | `senderPublicKey` | Binary \| null | Unused for now; reserved for message signing |
 | `timestamp` | Date | When the server accepted the message |
 
-The message bytes sit in a field named `ciphertext` even though they are still
-plain text today. The name describes what the field will hold once encryption
-lands, so that change will not have to move existing data.
+Only the message body is encrypted. The sender, the room and the timestamp are
+stored as they are, because history is read and sorted by them.
 
 Index: `{ roomId: 1, _id: 1 }`, matching how history is read (one room, in order).
 
@@ -66,6 +77,49 @@ limit, which is the wrong end of the conversation.
 first, a client could connect and send a message before the database was ready,
 and that message would be lost. `SIGINT`/`SIGTERM` close the connection on the
 way out.
+
+## Encryption at rest
+
+Messages are encrypted with **AES-256-GCM** before they are stored and decrypted
+again when history is read. `src/crypto/messageCipher.js` holds both halves and
+uses Node's built-in `node:crypto`, not an implementation of our own.
+
+- **A fresh 12-byte nonce per message**, from `randomBytes`. Reusing a nonce with
+  the same key is the one mistake that breaks GCM outright, so nothing here ever
+  reuses one. It also means two identical messages produce different ciphertext.
+- **The authentication tag is appended to the ciphertext.** Tag and ciphertext
+  are useless apart, so keeping them in one field means they cannot drift out of
+  step. `decrypt` splits the last 16 bytes back off and calls `setAuthTag`
+  before `final()`.
+- **The socket traffic still carries plain text.** The requirement is that the
+  database holds nothing readable, not that clients cannot read messages sent to
+  them. End-to-end encryption between browsers is a different problem.
+
+Changing `CHAT_ENCRYPTION_KEY` does not re-encrypt anything: messages written
+under the old key stop being readable and start showing up as failed integrity
+checks. The same is true of any message stored before encryption was added.
+
+### Tamper detection
+
+GCM's tag is checked on the way out, so a stored message that was edited in the
+database no longer decrypts. That failure is reported, not thrown:
+
+- `loadHistory` decrypts each document inside its own `try`/`catch`.
+- A document that fails is sent as `{ id, username, text: null, timestamp,
+  integrity: 'failed' }` and logged server-side with its id.
+- Every other message in the same history loads normally. One tampered document
+  must not cost everyone else the conversation.
+
+To see it happen, send a few messages and then run:
+
+```bash
+cd server
+npm run tamper-demo
+```
+
+It flips one bit of the newest stored message and prints the bytes before and
+after. Reload the client: that message is marked as failing verification and the
+rest are unaffected.
 
 ## HTTP endpoints
 
@@ -99,8 +153,14 @@ Liveness check. Returns:
 | `user-left` | `{ username, timestamp }` | Everyone except the disconnecting socket |
 | `user-typing` | `{ username, isTyping }` | Everyone except the typing socket |
 | `online-users` | `string[]` | Everyone, after any join/leave |
-| `chat-history` | `{ id, username, text, timestamp }[]` | The joining socket only, right after `join-success` |
+| `chat-history` | `{ id, username, text, timestamp, integrity? }[]` | The joining socket only, right after `join-success` |
 | `chat-message` | `{ id, username, text, timestamp }` | Everyone, including the sender |
+
+`integrity` appears in `chat-history` only, and only on a message whose stored
+copy failed its authentication check. It is then `'failed'` and `text` is `null`,
+so the client has nothing to show as the message and says so instead. Live
+`chat-message` broadcasts never carry it: they are sent from what the server just
+received, so there is nothing to verify yet.
 
 `id` is the message's MongoDB `_id` as a 24-character hex string. The same id is
 used in `chat-history` and `chat-message`, so a client can tell that a message it

@@ -8,15 +8,15 @@ const DEFAULT_HISTORY_LIMIT = 100;
 //   _id              ObjectId  also used as the message id we send to clients
 //   roomId           string    one room for now, always 'main'
 //   senderId         string    the username that sent it
-//   ciphertext       Binary    the message bytes
-//   nonce            Binary    null for now, used once messages are encrypted
+//   ciphertext       Binary    the encrypted message, with its authentication tag on the end
+//   nonce            Binary    the nonce this message was encrypted with
 //   signature        Binary    null for now, used once messages are signed
 //   senderPublicKey  Binary    null for now, used once messages are signed
 //   timestamp        Date      when the server accepted the message
 //
-// The message bytes are stored in a field called "ciphertext" even though they
-// are still plain text at this point. The field is named for what it will hold
-// once encryption is added, so that change will not need to move any data.
+// This file stores and returns those bytes as they are. Encrypting and
+// decrypting them is the caller's job, so the queries stay independent of how
+// messages are protected.
 //
 // All database queries live in this file. The socket handlers call these two
 // functions and never touch the collection themselves.
@@ -85,4 +85,4 @@ function toBuffer(value) {
   return Buffer.from(value);
 }
 
-module.exports = { saveMessage, getHistory, DEFAULT_HISTORY_LIMIT, COLLECTION };
+module.exports = { saveMessage, getHistory, toBuffer, DEFAULT_HISTORY_LIMIT, COLLECTION };

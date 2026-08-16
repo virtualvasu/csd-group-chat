@@ -55,6 +55,29 @@ The goal is to confirm the required flow works across machines, not just on a si
 You can also check the stored messages directly in the Atlas UI under
 **Browse Collections → csd_group_chat → messages**.
 
+### 6) Encryption at rest
+- Send a message with a memorable phrase in it.
+- Open the `messages` collection in Compass, the Atlas UI or `mongosh`
+  (`db.messages.find()`).
+- Confirm `ciphertext` is binary and the phrase does not appear anywhere in the
+  document. `senderId` and `timestamp` are stored as they are, by design.
+- Confirm every document has its own `nonce`, and that two identical messages
+  produce different `ciphertext`.
+
+### 7) Tamper detection
+- With a few messages in the room, run:
+  ```bash
+  cd server
+  npm run tamper-demo
+  ```
+  It flips one bit of the newest stored message and prints the bytes before and
+  after. This is the screenshot the submission asks for.
+- Reload the client and rejoin.
+- Confirm the tampered message is shown as failing integrity verification, with
+  no message text.
+- Confirm every other message still loads normally, and that the server logged
+  the failure with the message id.
+
 ## Automated tests
 
 ```bash
@@ -66,6 +89,10 @@ The database tests need `MONGODB_URI` set in `server/.env`. They run against a
 separate database (`csd_group_chat_test`) so they never touch the real chat
 data. Without a connection string they are skipped rather than failed, so the
 rest of the suite still runs.
+
+The encryption tests need no database and no key of your own: they generate a
+key of their own, cover the encrypt/decrypt round trip, and check that a flipped
+ciphertext byte or nonce is rejected.
 
 ## Acceptance criteria check
 
@@ -79,6 +106,8 @@ The app passes when all of the following are true:
 - messages are still there after the server is restarted
 - someone joining late sees the messages sent before they arrived
 - reconnecting does not show the conversation twice
+- the stored messages hold no readable text
+- a message edited in the database is flagged in the chat while the rest load
 - README instructions match the actual lab setup that worked
 
 ## Suggested test record
