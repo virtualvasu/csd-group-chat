@@ -78,7 +78,86 @@ You can also check the stored messages directly in the Atlas UI under
 - Confirm every other message still loads normally, and that the server logged
   the failure with the message id.
 
-### 8) Signature verification (Issue #14)
+## Submission demo verification
+
+This section covers the three required demos for the issue submission: persistence, tamper detection, and signature verification.
+
+### Demo 1: Persistence
+
+**Goal:** Prove that messages survive a server restart.
+
+**Setup:**
+- Four users already connected, 5-10 messages exchanged.
+
+**Steps:**
+1. Note the messages visible in the chat window.
+2. On the server machine, run `Ctrl+C` to stop the server.
+3. Wait 2-3 seconds.
+4. Restart the server with `npm start`.
+5. On one of the client machines, reload the browser (`Ctrl+R` or `Cmd+R`).
+6. Rejoin with the same username.
+
+**Expected result:**
+- The chat window shows all the messages from before the restart, in the same order.
+- No messages are lost, duplicated, or out of order.
+- The join notice for the reconnecting user appears after the historical messages.
+
+**Evidence to capture:**
+- Screenshot showing the chat window with multiple messages before restart.
+- Screenshot showing the same messages after server restart and client reload.
+
+---
+
+### Demo 2: Tamper detection
+
+**Goal:** Prove that modified messages are detected and flagged.
+
+**Setup:**
+- Server running, 5-10 messages already in the database.
+
+**Steps:**
+1. Take a screenshot of the current chat window showing the messages.
+2. On the server machine, run:
+   ```bash
+   cd server
+   npm run tamper-demo
+   ```
+   This prints the message id, the byte offset, and the before/after bytes of the bit that was flipped.
+3. Take a screenshot of the console output showing the tamper-demo results.
+4. On one of the client machines, reload the browser and rejoin.
+
+**Expected result:**
+- The client loads the messages.
+- The tampered message (identified by id in the tamper-demo output) appears with:
+  - **No message text** (shows as empty or null)
+  - **Integrity: failed** flag displayed in the UI
+- All other messages load and display normally.
+- The server console shows a log message: `Message [id] failed integrity verification`.
+
+**Evidence to capture:**
+- Screenshot of console output from `npm run tamper-demo` showing byte flip.
+- Screenshot of the chat UI showing the tampered message flagged as failed integrity.
+- Screenshot of the MongoDB collection showing binary ciphertext (see "Binary ciphertext evidence" below).
+
+**Binary ciphertext evidence:**
+
+To show that messages are encrypted and not stored as plaintext:
+
+1. Open the MongoDB UI (Atlas or `mongosh`).
+2. Browse to `csd_group_chat` database → `messages` collection.
+3. Run:
+   ```bash
+   db.messages.find()
+   ```
+   or use the Atlas UI to view documents.
+4. Take a screenshot showing a message document where:
+   - `ciphertext` field contains **binary data** (not readable text)
+   - `senderId` and `timestamp` are in plaintext (by design)
+   - The memorable phrase from any message does **not** appear in the `ciphertext` field
+
+---
+
+### Demo 3: Signature verification (Issue #14)
 
 #### Every message shows a trust badge
 - Join as any user and send a message.
@@ -95,7 +174,7 @@ You can also check the stored messages directly in the Atlas UI under
   the two clients hold distinct key pairs.
 
 #### Forging a signature is caught
-Note that this is a *different* check from step 7, and the two are worth doing
+Note that this is a *different* check from Demo 2 (tamper detection), and the two are worth doing
 separately — encryption protects the stored bytes, signing protects who the
 message is attributed to.
 
@@ -107,7 +186,7 @@ message is attributed to.
    readable — the server re-verifies every signature on history load and never
    trusts a stored verdict.
 
-If you edit `ciphertext` instead, you get the step 7 result rather than this
+If you edit `ciphertext` instead, you get the Demo 2 result rather than this
 one: the message fails to decrypt, so it is reported as an integrity failure and
 its signature verdict is "unknown". There is no plaintext left to check a
 signature against, so the sender is not blamed for it.
@@ -117,6 +196,8 @@ signature against, so the sender is not blamed for it.
 - In Browser B (or incognito — different IndexedDB), attempt to join as `alice`.
 - Expect a `join-error`: "This username is registered to a different key."
   Browser B cannot impersonate `alice` because it holds a different key pair.
+
+---
 
 ## Automated tests
 

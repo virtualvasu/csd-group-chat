@@ -225,7 +225,7 @@ join, broadcast, leave, and disconnect flow. The assignment requirement is to
 verify all four people can participate at the same time, and that a temporary
 network drop does not leave the client stuck in a broken state.
 
-## Message history
+## Message history and persistence
 
 Every message is written to MongoDB before it is sent out, so the conversation
 is not lost when the server stops. When someone joins, the server reads the
@@ -236,6 +236,9 @@ History is sent again whenever a client rejoins, including after a reconnect.
 Each message carries the id it was stored under, and the client ignores ids it
 already has, so a brief network drop does not show the conversation twice.
 
+Messages survive a server restart and are retrievable after the database
+reopens.
+
 ## Encryption at rest
 
 Messages are encrypted with AES-256-GCM before they reach the database and
@@ -245,15 +248,86 @@ authentication tag stored alongside it is what makes editing a stored message
 detectable: it no longer decrypts, and the client shows it as failing
 verification rather than showing text nobody sent.
 
-Live messages still travel over the socket as text. The point here is that the
-database holds nothing readable, not that clients cannot read their own chat.
+Live messages still travel over the socket as text (see "Security Properties"
+below). The point here is that the database holds nothing readable, not that
+clients cannot read their own chat.
 
 The key lives in `CHAT_ENCRYPTION_KEY` in `server/.env`, and `server/README.md`
 covers the details, including `npm run tamper-demo` for demonstrating the
 detection.
 
+### Encryption flow (store path)
+
+When a message is sent:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant Crypto as Crypto (AES-256-GCM)
+    participant DB as MongoDB
+
+    C->>S: chat-message (plaintext)
+    S->>S: validate message
+    S->>Crypto: encrypt(message, nonce, key)
+    Crypto-->>S: ciphertext + auth tag
+    S->>DB: save (ciphertext, nonce, timestamp, username)
+    DB-->>S: message id
+    S->>C: ✓ message saved (echo back plaintext)
+    S->>Other: broadcast (plaintext to all)
+```
+
+### Retrieval and verification flow (read path)
+
+When a user joins or requests history:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant DB as MongoDB
+    participant Crypto as Crypto (AES-256-GCM)
+
+    C->>S: join (username)
+    S->>DB: getHistory(roomId)
+    DB-->>S: [docs with ciphertext, nonce]
+    S->>Crypto: decrypt(ciphertext, nonce, key)
+    alt auth tag matches
+        Crypto-->>S: plaintext
+        S->>C: chat-history (plaintext messages)
+    else auth tag fails (tampering)
+        Crypto-->>S: error
+        S->>C: chat-history (message with integrity: failed)
+    end
+```
+
+## Security properties
+
+This application implements four core security properties:
+
+- **Persistence:** Messages are durably stored in MongoDB and survive server restart.
+- **Confidentiality:** Messages in the database are encrypted with AES-256-GCM. An attacker with database access cannot read the conversation without the encryption key.
+- **Integrity:** The AES-GCM authentication tag detects if a stored message is modified; a tampered message fails to decrypt and is flagged in the UI.
+- **Authenticity:** While online, each username is claimed by only one user. The server enforces this; usernames are unique per session.
+
+For a full security analysis, including what this system does **not** protect against and what a production system would add, see [SECURITY.md](SECURITY.md).
+
+## Encryption and key management
+
+Every server instance that uses the same MongoDB database **must share the same encryption key**. Generate the key once:
+
+```bash
+cd server
+npm run generate-key
+```
+
+Copy the output into the `CHAT_ENCRYPTION_KEY` variable in `server/.env` on every machine that runs the server. The key is not committed to git; each developer has their own `.env` file.
+
+If two servers use different keys, messages encrypted by one server cannot be decrypted by the other, and you will see integrity failures for all messages.
+
 ## Roadmap (post-MVP)
 
-- Per-sender signing keys so message authorship can be verified
+- Per-sender cryptographic signatures so message authorship can be verified client-side
 - Private (1:1) messaging
 - Improved styling / mobile layout
+- Transport layer security (TLS/HTTPS + WSS for all connections)
