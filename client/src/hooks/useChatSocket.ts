@@ -1,10 +1,31 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import type { ConnectionStatus, TimelineItem } from "@/types";
+import type {
+  ConnectionStatus,
+  ServerMessage,
+  StoredItem,
+  TimelineItem,
+} from "@/types";
 
 const TYPING_IDLE_MS = 2000;
 let seq = 0;
 const nextId = () => `${Date.now()}-${seq++}`;
+
+// Works out which messages should sit tight under the one above them: a
+// message is grouped when the item before it is a message from the same
+// person. Doing this here rather than when a message arrives means the flags
+// stay right no matter what order things were added in.
+function buildTimeline(items: StoredItem[]): TimelineItem[] {
+  return items.map((item, index) => {
+    if (item.kind === "system") return item;
+
+    const previous = items[index - 1];
+    const grouped =
+      previous?.kind === "chat" && previous.username === item.username;
+
+    return { ...item, grouped };
+  });
+}
 
 export function useChatSocket() {
   const socketRef = useRef<Socket | null>(null);
@@ -20,10 +41,12 @@ export function useChatSocket() {
     useState<ConnectionStatus>("connected");
   const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
-  const [timeline, setTimeline] = useState<TimelineItem[]>([]);
+  const [items, setItems] = useState<StoredItem[]>([]);
+
+  const timeline = useMemo(() => buildTimeline(items), [items]);
 
   const pushSystem = useCallback((text: string, timestamp = Date.now()) => {
-    setTimeline((prev) => [
+    setItems((prev) => [
       ...prev,
       { kind: "system", id: nextId(), text, timestamp },
     ]);
@@ -40,6 +63,17 @@ export function useChatSocket() {
           socket.emit("join", usernameRef.current);
         }
       }, 250);
+    }
+
+    function toChatItem(message: ServerMessage): StoredItem {
+      return {
+        kind: "chat",
+        id: message.id,
+        username: message.username,
+        text: message.text,
+        timestamp: message.timestamp,
+        own: message.username === usernameRef.current,
+      };
     }
 
     socket.on("connect", () => {
@@ -105,24 +139,37 @@ export function useChatSocket() {
       });
     });
 
-    socket.on("chat-message", (message) => {
+    // Earlier messages, sent to us right after we join.
+    //
+    // This arrives again after every reconnect, because reconnecting re-sends
+    // the join. So only add messages we do not already have, otherwise one
+    // short network drop would show the whole conversation twice. Anything
+    // that was sent while we were offline is new to us and does get added.
+    socket.on("chat-history", (history: ServerMessage[]) => {
+      if (!Array.isArray(history) || history.length === 0) return;
+
+      setItems((prev) => {
+        const known = new Set(
+          prev.filter((item) => item.kind === "chat").map((item) => item.id)
+        );
+        const missing = history
+          .filter((message) => !known.has(message.id))
+          .map(toChatItem);
+
+        return missing.length === 0 ? prev : [...prev, ...missing];
+      });
+    });
+
+    socket.on("chat-message", (message: ServerMessage) => {
       setTypingUsers((prev) => prev.filter((u) => u !== message.username));
-      setTimeline((prev) => {
-        const last = prev[prev.length - 1];
-        const grouped =
-          last?.kind === "chat" && last.username === message.username;
-        return [
-          ...prev,
-          {
-            kind: "chat",
-            id: nextId(),
-            username: message.username,
-            text: message.text,
-            timestamp: message.timestamp,
-            own: message.username === usernameRef.current,
-            grouped,
-          },
-        ];
+      setItems((prev) => {
+        // The sender already has this one if the history arrived first, so
+        // check before adding it a second time.
+        if (prev.some((item) => item.kind === "chat" && item.id === message.id)) {
+          return prev;
+        }
+
+        return [...prev, toChatItem(message)];
       });
     });
 

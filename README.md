@@ -1,12 +1,15 @@
 # CSD Group Chat
 
-Real-time group chat application built with WebSockets (Socket.IO). One backend
-server, multiple browser clients — everyone in one shared room.
+Real-time group chat application built with WebSockets (Socket.IO), with
+messages stored in MongoDB. One backend server, multiple browser clients —
+everyone in one shared room.
 
 ## MVP features
 
 - Join with a username (unique while you are online)
 - Real-time message broadcast to everyone in the room
+- Messages saved to MongoDB, so they survive a server restart
+- New joiners receive the earlier messages in the room
 - Join / leave notifications with timestamps
 - Live online-users list
 - "User is typing..." indicator
@@ -15,6 +18,30 @@ server, multiple browser clients — everyone in one shared room.
 A username can only be online once. Joining from a second tab with a name that
 is already in use is rejected on the join screen; use a different name, or
 close the first tab to free it. See `server/README.md` for details.
+
+## Setting up the database
+
+Messages are stored in MongoDB Atlas (the free M0 tier is enough for this).
+
+1. Create a free account at [mongodb.com/atlas](https://www.mongodb.com/atlas)
+   and create an **M0 (free)** cluster.
+2. Under **Database Access**, add a database user with a password.
+3. Under **Network Access**, add the IP address of the machine that will run the
+   server. If you are moving between lab machines, add each one. A connection
+   that hangs and then times out is almost always a missing entry here.
+4. Open **Cluster → Connect → Drivers → Node.js** and copy the connection string.
+5. Create your local config file:
+
+   ```bash
+   cd server
+   cp .env.example .env
+   ```
+
+   Open `server/.env` and paste the connection string into `MONGODB_URI`,
+   replacing `<password>` with the database user's password.
+
+`server/.env` is ignored by git, so the connection string is never committed.
+Everyone running the server needs their own copy of this file.
 
 ## Running the server
 
@@ -34,6 +61,10 @@ cd server
 npm install
 npm start
 ```
+
+The server connects to MongoDB before it starts accepting clients. If
+`MONGODB_URI` is missing or wrong, it stops with a message saying so rather
+than starting up and losing messages.
 
 The server starts on `http://localhost:3000` and also serves the built
 frontend (`client/dist`), so there's nothing separate to run for the UI.
@@ -73,7 +104,9 @@ lab demonstrations and troubleshooting.
 
 One Node.js server handles every client over WebSockets (via Socket.IO).
 There is a single shared room — every message is broadcast to everyone
-connected.
+connected, and every message is stored in MongoDB.
+
+The WebSocket gives us real-time delivery; the database gives us history.
 
 ```mermaid
 flowchart LR
@@ -89,7 +122,10 @@ flowchart LR
         VAL[Validation]
         RL[Rate Limiter]
         PR[Presence Store]
+        REPO[Message Repository]
     end
+
+    DB[(MongoDB Atlas)]
 
     C1 <-->|WebSocket| SH
     C2 <-->|WebSocket| SH
@@ -99,14 +135,18 @@ flowchart LR
     SH --> VAL
     SH --> RL
     SH --> PR
+    SH --> REPO
+    REPO <--> DB
 ```
 
-Message flow for a single chat message:
+Message flow for a single chat message. The message is stored before it is
+broadcast, so anything a client receives is already saved:
 
 ```mermaid
 sequenceDiagram
     participant A as Client (sender)
     participant S as Server
+    participant DB as MongoDB
     participant B as Other Clients
 
     A->>S: chat-message (text)
@@ -116,15 +156,37 @@ sequenceDiagram
     alt invalid or rate-limited
         S-->>A: message-error
     else valid
-        S->>A: chat-message (broadcast)
-        S->>B: chat-message (broadcast)
+        S->>DB: save message
+        DB-->>S: message id
+        S->>A: chat-message (id, text, timestamp)
+        S->>B: chat-message (id, text, timestamp)
     end
+```
+
+What a user gets when they join:
+
+```mermaid
+sequenceDiagram
+    participant U as Joining Client
+    participant S as Server
+    participant DB as MongoDB
+    participant O as Other Clients
+
+    U->>S: join (username)
+    S->>S: validate + check name is free
+    S-->>U: join-success
+    S->>DB: read messages for the room
+    DB-->>S: earlier messages
+    S-->>U: chat-history
+    S->>O: user-joined
+    S->>U: online-users
+    S->>O: online-users
 ```
 
 ## Project structure
 
 ```
-server/   Express + Socket.IO backend (message broadcast, join/leave, disconnects)
+server/   Express + Socket.IO backend (message broadcast, join/leave, disconnects, MongoDB storage)
 client/   React + TypeScript + shadcn/ui frontend (build with `npm run build`)
 ```
 
@@ -135,8 +197,21 @@ join, broadcast, leave, and disconnect flow. The assignment requirement is to
 verify all four people can participate at the same time, and that a temporary
 network drop does not leave the client stuck in a broken state.
 
+## Message history
+
+Every message is written to MongoDB before it is sent out, so the conversation
+is not lost when the server stops. When someone joins, the server reads the
+recent messages for the room and sends them to that person only, so they can
+catch up on what was said before they arrived.
+
+History is sent again whenever a client rejoins, including after a reconnect.
+Each message carries the id it was stored under, and the client ignores ids it
+already has, so a brief network drop does not show the conversation twice.
+
 ## Roadmap (post-MVP)
 
-- Message history / persistence
+- Encrypt stored messages instead of keeping them readable in the database
+- Detect tampering with stored messages
+- Per-sender signing keys so message authorship can be verified
 - Private (1:1) messaging
 - Improved styling / mobile layout

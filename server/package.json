@@ -4,11 +4,12 @@
   "description": "Backend server for real-time group chat (WebSockets / Socket.IO)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test"
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node --env-file-if-exists=.env --test"
   },
   "dependencies": {
     "express": "^4.19.2",
+    "mongodb": "^7.5.0",
     "socket.io": "^4.7.5"
   },
   "devDependencies": {

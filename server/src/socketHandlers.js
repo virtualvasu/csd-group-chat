@@ -1,11 +1,19 @@
 const { validateUsername, validateMessage } = require('./validation');
+const { saveMessage, getHistory } = require('./db/messageRepository');
+
+// There is only one room for now. Every message is stored against this id, so
+// adding more rooms later is a matter of passing a real id through.
+const ROOM_ID = 'main';
 
 // Full list of events is in server/README.md
 function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
+  // Wraps a handler so a thrown error tells the client something went wrong
+  // instead of taking the server down. Handlers are async now that they talk
+  // to the database, so we catch failed promises as well as thrown errors.
   function safeHandler(fn) {
-    return (...args) => {
+    return async (...args) => {
       try {
-        fn(...args);
+        await fn(...args);
       } catch (err) {
         console.error(`Error handling event from ${socket.id}:`, err);
         socket.emit('server-error', { message: 'Something went wrong. Please try again.' });
@@ -13,9 +21,23 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
     };
   }
 
+  // Reads the stored messages for the room and turns them into the shape the
+  // client expects. A database problem here should not stop someone joining,
+  // so the caller decides what to do if this throws.
+  async function loadHistory() {
+    const stored = await getHistory(ROOM_ID);
+
+    return stored.map((message) => ({
+      id: message.id,
+      username: message.senderId,
+      text: message.ciphertext.toString('utf8'),
+      timestamp: message.timestamp.getTime(),
+    }));
+  }
+
   socket.on(
     'join',
-    safeHandler((rawUsername) => {
+    safeHandler(async (rawUsername) => {
       if (socket.data.username) return; // already joined
 
       const result = validateUsername(rawUsername);
@@ -41,6 +63,19 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       socket.data.username = result.username;
 
       socket.emit('join-success', { username: result.username });
+
+      // Send the earlier messages before announcing the join, so the new user
+      // sees the conversation in order rather than their own join line first.
+      // If the history cannot be read we still let them into the chat, because
+      // losing old messages is better than blocking the join completely.
+      try {
+        socket.emit('chat-history', await loadHistory());
+      } catch (err) {
+        console.error('Could not load chat history:', err);
+        socket.emit('chat-history', []);
+        socket.emit('server-error', { message: 'Could not load earlier messages.' });
+      }
+
       socket.broadcast.emit('user-joined', { username: result.username, timestamp: Date.now() });
       io.emit('online-users', presence.list());
     })
@@ -48,7 +83,7 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
 
   socket.on(
     'chat-message',
-    safeHandler((rawText) => {
+    safeHandler(async (rawText) => {
       const username = socket.data.username;
       if (!username) {
         socket.emit('message-error', { message: 'You must join before sending messages.' });
@@ -66,10 +101,22 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         return;
       }
 
+      // Store first, then send it out. That way anything a client receives is
+      // already saved, and the broadcast can carry the id the message was
+      // stored under.
+      const timestamp = new Date();
+      const id = await saveMessage({
+        roomId: ROOM_ID,
+        senderId: username,
+        ciphertext: Buffer.from(result.text, 'utf8'),
+        timestamp,
+      });
+
       io.emit('chat-message', {
+        id,
         username,
         text: result.text,
-        timestamp: Date.now(),
+        timestamp: timestamp.getTime(),
       });
     })
   );
@@ -97,4 +144,4 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
   );
 }
 
-module.exports = { registerSocketHandlers };
+module.exports = { registerSocketHandlers, ROOM_ID };
