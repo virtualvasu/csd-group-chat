@@ -7,6 +7,11 @@ const { io } = require('socket.io-client');
 const { Presence } = require('../src/presence');
 const { RateLimiter } = require('../src/rateLimiter');
 const { registerSocketHandlers } = require('../src/socketHandlers');
+const { connectTestDb, closeTestDb, skipReason } = require('./helpers/testDb');
+
+// Joining now also reads the stored messages, so these tests need a database
+// as well. Without one the join still works, but it logs an error every time.
+const needsDatabase = !skipReason();
 
 let httpServer;
 let ioServer;
@@ -25,6 +30,8 @@ function waitForEvent(socket, eventName, timeoutMs = 5000) {
 }
 
 test.before(async () => {
+  if (needsDatabase) await connectTestDb('reconnect');
+
   const app = createServer();
   ioServer = new Server(app, { transports: ['websocket'] });
   presence = new Presence();
@@ -48,6 +55,7 @@ test.after(async () => {
   if (httpServer) {
     await new Promise((resolve) => httpServer.close(() => resolve()));
   }
+  if (needsDatabase) await closeTestDb();
 });
 
 test('rejoining a username after disconnect keeps a single presence entry', async () => {
