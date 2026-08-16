@@ -7,6 +7,7 @@ const { Presence } = require('./src/presence');
 const { RateLimiter } = require('./src/rateLimiter');
 const { registerSocketHandlers } = require('./src/socketHandlers');
 const { createHealthRouter } = require('./src/routes/health');
+const { loadKey } = require('./src/crypto/messageCipher');
 const db = require('./src/db');
 
 const app = express();
@@ -27,6 +28,11 @@ app.use(createHealthRouter(presence));
 // client could send a message before the database was ready and that message
 // would be lost.
 async function start() {
+  // Check the encryption key before anything else. A missing or malformed key
+  // only shows up when the first message is sent otherwise, by which point
+  // people are already in the room and that message is lost.
+  loadKey();
+
   await db.connect();
   console.log('Connected to MongoDB');
 

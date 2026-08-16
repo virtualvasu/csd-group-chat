@@ -2,10 +2,34 @@ const { validateUsername, validateMessage } = require('./validation');
 const { saveMessage, getHistory } = require('./db/messageRepository');
 const { findSender, registerSender } = require('./db/senderRepository');
 const { verifySignature, isTimestampFresh } = require('./crypto/signatures');
+const { encrypt, decrypt } = require('./crypto/messageCipher');
 
 // There is only one room for now. Every message is stored against this id, so
 // adding more rooms later is a matter of passing a real id through.
 const ROOM_ID = 'main';
+
+// Re-checks the ECDSA signature on one already-decrypted stored message.
+//
+// The signature covers the plaintext, so this can only run after the message
+// has decrypted. Messages written before signing existed, or by a client that
+// does not sign, carry no signature and are reported as 'unsigned' rather than
+// as a failure.
+async function verifyStoredSignature(message, text) {
+  if (!message.signature || !message.senderPublicKey) return 'unsigned';
+
+  const valid = await verifySignature(
+    message.senderId,
+    // Signing used the client's claimed timestamp, so verification has to use
+    // the same one. Messages stored before that field existed fall back to the
+    // server timestamp, which is what they were signed with.
+    message.clientTimestamp ?? message.timestamp.getTime(),
+    text,
+    message.signature.toString('base64'),
+    message.senderPublicKey.toString('base64')
+  );
+
+  return valid ? 'valid' : 'invalid';
+}
 
 // Full list of events is in server/README.md
 function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
@@ -24,42 +48,53 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
   }
 
   // Reads the stored messages for the room and turns them into the shape the
-  // client expects.  Signatures are re-verified on every history load — we
-  // never trust a previously stored verdict, so manual edits to ciphertext or
-  // signature fields in the database are always caught.
+  // client expects. A database problem here should not stop someone joining,
+  // so the caller decides what to do if this throws.
+  //
+  // Two independent checks run over every stored message and both verdicts are
+  // sent on:
+  //
+  //   integrity — does the stored copy still match its GCM authentication tag?
+  //               Catches anything that edited the database directly.
+  //   signature — does the sender's ECDSA signature still verify over the text?
+  //               Catches a message that was not sent by the account it is
+  //               attributed to.
+  //
+  // They run in that order because the signature covers the plaintext: until a
+  // message decrypts there is nothing to verify it against. A message that
+  // fails to decrypt gets a signature verdict of 'unknown', not 'invalid' — we
+  // cannot recover what was signed, so blaming the sender would be wrong.
+  //
+  // Neither verdict is ever read back from the database, only recomputed. A
+  // stored "this one was fine" flag would be exactly as editable as the message
+  // it vouches for.
+  //
+  // Each message is handled on its own, so one tampered message does not cost
+  // everyone else their whole history.
   async function loadHistory() {
     const stored = await getHistory(ROOM_ID);
 
     return Promise.all(
       stored.map(async (message) => {
-        const text = message.ciphertext.toString('utf8');
-
-        let signatureStatus;
-        if (!message.signature || !message.senderPublicKey) {
-          signatureStatus = 'unsigned';
-        } else {
-          const sigB64 = message.signature.toString('base64');
-          const keyB64 = message.senderPublicKey.toString('base64');
-          const valid = await verifySignature(
-            message.senderId,
-            message.clientTimestamp ?? message.timestamp.getTime(),
-            text,
-            sigB64,
-            keyB64
-          );
-          signatureStatus = valid ? 'valid' : 'invalid';
-        }
-
-        return {
+        const common = {
           id: message.id,
           username: message.senderId,
-          text,
           timestamp: message.timestamp.getTime(),
-          signature: signatureStatus,
           senderPublicKey: message.senderPublicKey
             ? message.senderPublicKey.toString('base64')
             : null,
         };
+
+        let text;
+        try {
+          text = decrypt(message);
+        } catch (err) {
+          console.error(`Message ${message.id} failed integrity verification:`, err.message);
+
+          return { ...common, text: null, integrity: 'failed', signature: 'unknown' };
+        }
+
+        return { ...common, text, signature: await verifyStoredSignature(message, text) };
       })
     );
   }
@@ -206,16 +241,22 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
       // already saved, and the broadcast can carry the id the message was
       // stored under.
       //
-      // The server records its own timestamp for the stored record.
-      // Signature verification used the *client's* claimed timestamp.
+      // Only the stored copy is encrypted. The broadcast below still carries
+      // the text, because the requirement here is that the database holds no
+      // readable message, not that clients cannot read what was sent to them.
+      //
+      // The server stamps its own time on the record, but the signature was
+      // made over the client's claimed time, so that one is stored alongside it
+      // — without it, no stored signature could ever be re-verified.
       const serverTimestamp = new Date();
+      const { ciphertext, nonce } = encrypt(result.text);
 
       const id = await saveMessage({
         roomId: ROOM_ID,
         senderId: username,
-        ciphertext: Buffer.from(result.text, 'utf8'),
+        ciphertext,
+        nonce,
         timestamp: serverTimestamp,
-        // Store the client timestamp so history re-verification can use it.
         clientTimestamp: clientTimestamp ?? serverTimestamp.getTime(),
         signature: signatureB64 ? Buffer.from(signatureB64, 'base64') : null,
         senderPublicKey: publicKey ? Buffer.from(publicKey, 'base64') : null,

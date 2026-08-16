@@ -92,6 +92,7 @@ export function useChatSocket() {
         own: message.username === usernameRef.current,
         signature: message.signature ?? "unsigned",
         senderPublicKey: message.senderPublicKey ?? null,
+        integrity: message.integrity,
       };
     }
 

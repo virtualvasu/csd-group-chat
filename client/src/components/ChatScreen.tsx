@@ -168,22 +168,44 @@ export function ChatScreen({
                     <span className="font-mono text-[0.7rem] text-mist">
                       {formatTime(item.timestamp)}
                     </span>
-                    {/* Signature trust badge — shown beside the timestamp */}
-                    <MessageTrustBadge
-                      status={item.signature}
-                      senderPublicKey={item.senderPublicKey}
-                    />
+                    {/* Who sent this. Left off when the message failed its
+                        integrity check, because the verdict there is only ever
+                        "unknown" and the block below already says so. */}
+                    {!item.integrity && (
+                      <MessageTrustBadge
+                        status={item.signature}
+                        senderPublicKey={item.senderPublicKey}
+                      />
+                    )}
                   </span>
                 )}
-                <p
-                  className={cn(
-                    "max-w-[75ch] rounded-md px-3 py-1.5 text-[0.925rem] leading-relaxed break-words",
-                    item.own ? "border-r-2" : "border-l-2"
-                  )}
-                  style={{ borderColor: colorForUser(item.username) }}
-                >
-                  {item.text}
-                </p>
+                {item.integrity ? (
+                  // The text of this one is not shown at all. What the database
+                  // holds is not what was sent, so there is nothing here worth
+                  // displaying as the message.
+                  <div
+                    className={cn(
+                      "flex max-w-[75ch] flex-col gap-1 rounded-md border border-rust/40 bg-rust/5 px-3 py-1.5",
+                      item.own ? "items-end" : "items-start"
+                    )}
+                  >
+                    <MessageTrustBadge status={item.integrity} />
+                    <p className="text-[0.925rem] leading-relaxed text-mist italic">
+                      ⚠ This message failed integrity verification and may have
+                      been modified
+                    </p>
+                  </div>
+                ) : (
+                  <p
+                    className={cn(
+                      "max-w-[75ch] rounded-md px-3 py-1.5 text-[0.925rem] leading-relaxed break-words",
+                      item.own ? "border-r-2" : "border-l-2"
+                    )}
+                    style={{ borderColor: colorForUser(item.username) }}
+                  >
+                    {item.text}
+                  </p>
+                )}
               </div>
             )
           )}

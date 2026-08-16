@@ -1,13 +1,29 @@
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
-/** The three possible signature verdicts the server emits. */
-export type SignatureStatus = "valid" | "invalid" | "unsigned";
+// How much a message can be trusted. Two separate questions are answered per
+// message, and they are kept apart because they can disagree: a message can
+// decrypt perfectly and still carry a signature from the wrong key.
+
+// Whether the stored copy still matches its authentication tag. Only the
+// failure is reported — a message that is fine carries no integrity field.
+export type IntegrityStatus = "failed";
+
+// Whether the sender's ECDSA signature verifies over the message text.
+// "unsigned" means none was supplied, which is what messages from before
+// signing existed look like. "unknown" means the message did not decrypt, so
+// there is no plaintext left to check a signature against.
+export type SignatureStatus = "valid" | "invalid" | "unsigned" | "unknown";
+
+// What MessageTrustBadge can render. Either verdict can be handed to it.
+export type TrustStatus = SignatureStatus | IntegrityStatus;
 
 export interface ChatMessageItem {
   kind: "chat";
   id: string;
   username: string;
-  text: string;
+  // Null when the server could not recover the text, which happens when the
+  // stored message failed its integrity check.
+  text: string | null;
   timestamp: number;
   own: boolean;
   grouped: boolean;
@@ -15,6 +31,8 @@ export interface ChatMessageItem {
   signature: SignatureStatus;
   /** base64 SPKI public key of the sender, or null for unsigned messages. */
   senderPublicKey: string | null;
+  /** Present only when the stored copy failed its integrity check. */
+  integrity?: IntegrityStatus;
 }
 
 export interface SystemMessageItem {
@@ -35,10 +53,12 @@ export type StoredItem = Omit<ChatMessageItem, "grouped"> | SystemMessageItem;
 export interface ServerMessage {
   id: string;
   username: string;
-  text: string;
+  text: string | null;
   timestamp: number;
   /** ECDSA signature verdict. */
   signature: SignatureStatus;
   /** base64 SPKI public key, or null for unsigned messages. */
   senderPublicKey: string | null;
+  /** Present only when the stored copy failed its integrity check. */
+  integrity?: IntegrityStatus;
 }

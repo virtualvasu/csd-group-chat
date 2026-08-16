@@ -55,12 +55,36 @@ The goal is to confirm the required flow works across machines, not just on a si
 You can also check the stored messages directly in the Atlas UI under
 **Browse Collections → csd_group_chat → messages**.
 
-### 6) Signature verification (Issue #14)
+### 6) Encryption at rest
+- Send a message with a memorable phrase in it.
+- Open the `messages` collection in Compass, the Atlas UI or `mongosh`
+  (`db.messages.find()`).
+- Confirm `ciphertext` is binary and the phrase does not appear anywhere in the
+  document. `senderId` and `timestamp` are stored as they are, by design.
+- Confirm every document has its own `nonce`, and that two identical messages
+  produce different `ciphertext`.
+
+### 7) Tamper detection
+- With a few messages in the room, run:
+  ```bash
+  cd server
+  npm run tamper-demo
+  ```
+  It flips one bit of the newest stored message and prints the bytes before and
+  after. This is the screenshot the submission asks for.
+- Reload the client and rejoin.
+- Confirm the tampered message is shown as failing integrity verification, with
+  no message text.
+- Confirm every other message still loads normally, and that the server logged
+  the failure with the message id.
+
+### 8) Signature verification (Issue #14)
 
 #### Every message shows a trust badge
 - Join as any user and send a message.
-- Confirm a small badge (e.g. "✓ Signed") appears next to the username/timestamp.
-- Hover the badge: the tooltip shows a short fingerprint like `key: a3f9b2c1`.
+- Confirm a small badge ("Signed") appears next to the username/timestamp.
+- Hover the badge: the tooltip explains the verdict and shows a short
+  fingerprint like `key: a3f9b2c1`.
 
 #### Two clients have different fingerprints
 - Open the app in two different **browsers** (or two different machines, or one
@@ -70,14 +94,23 @@ You can also check the stored messages directly in the Atlas UI under
 - Hover the badge on each message: the fingerprints must be different, confirming
   the two clients hold distinct key pairs.
 
-#### Tamper detection demo
+#### Forging a signature is caught
+Note that this is a *different* check from step 7, and the two are worth doing
+separately — encryption protects the stored bytes, signing protects who the
+message is attributed to.
+
 1. Open the Atlas UI (**Browse Collections → csd_group_chat → messages**).
-2. Find any stored document.
-3. Edit either the `ciphertext` field (the message text) or the `signature` field
-   to any different value and save.
-4. In the browser, reload the page and rejoin.
-5. The tampered message now shows "✗ Invalid" in red — the server re-verifies
-   every signature on history load and never trusts a stored verdict.
+2. Find a stored document and edit its `signature` field to any different value.
+   Leave `ciphertext` and `nonce` alone, so the message still decrypts.
+3. Reload the page and rejoin.
+4. The message now shows "Invalid signature" in red, with its text still
+   readable — the server re-verifies every signature on history load and never
+   trusts a stored verdict.
+
+If you edit `ciphertext` instead, you get the step 7 result rather than this
+one: the message fails to decrypt, so it is reported as an integrity failure and
+its signature verdict is "unknown". There is no plaintext left to check a
+signature against, so the sender is not blamed for it.
 
 #### TOFU key binding
 - Join as `alice` in Browser A. Send a message. Note the fingerprint.
@@ -97,8 +130,12 @@ separate database (`csd_group_chat_test`) so they never touch the real chat
 data. Without a connection string they are skipped rather than failed, so the
 rest of the suite still runs.
 
-The **signature tests** (`server/test/signatures.test.js`) are pure crypto — no
-database or network required — so they always run.
+The encryption tests need no database and no key of your own: they generate a
+key of their own, cover the encrypt/decrypt round trip, and check that a flipped
+ciphertext byte or nonce is rejected.
+
+The signature tests (`server/test/signatures.test.js`) are pure crypto too — no
+database or network required — so both suites always run.
 
 ## Acceptance criteria check
 
@@ -112,6 +149,8 @@ The app passes when all of the following are true:
 - messages are still there after the server is restarted
 - someone joining late sees the messages sent before they arrived
 - reconnecting does not show the conversation twice
+- the stored messages hold no readable text
+- a message edited in the database is flagged in the chat while the rest load
 - README instructions match the actual lab setup that worked
 - every message in the UI shows a signature trust badge ("✓ Signed", "✗ Invalid", or "· Unsigned")
 - manually editing a stored `ciphertext` or `signature` field in the DB makes that message show "✗ Invalid" after a reload

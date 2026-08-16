@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "test": "node --env-file-if-exists=.env --test"
+    "test": "node --env-file-if-exists=.env --test",
+    "generate-key": "node scripts/generate-key.js",
+    "tamper-demo": "node --env-file-if-exists=.env scripts/tamper-demo.js"
   },
   "dependencies": {
     "express": "^4.19.2",
