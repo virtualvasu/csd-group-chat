@@ -55,6 +55,36 @@ The goal is to confirm the required flow works across machines, not just on a si
 You can also check the stored messages directly in the Atlas UI under
 **Browse Collections → csd_group_chat → messages**.
 
+### 6) Signature verification (Issue #14)
+
+#### Every message shows a trust badge
+- Join as any user and send a message.
+- Confirm a small badge (e.g. "✓ Signed") appears next to the username/timestamp.
+- Hover the badge: the tooltip shows a short fingerprint like `key: a3f9b2c1`.
+
+#### Two clients have different fingerprints
+- Open the app in two different **browsers** (or two different machines, or one
+  normal window + one incognito window — each must have its own IndexedDB).
+- Join as `alice` in one and `bob` in the other.
+- Send a message from each.
+- Hover the badge on each message: the fingerprints must be different, confirming
+  the two clients hold distinct key pairs.
+
+#### Tamper detection demo
+1. Open the Atlas UI (**Browse Collections → csd_group_chat → messages**).
+2. Find any stored document.
+3. Edit either the `ciphertext` field (the message text) or the `signature` field
+   to any different value and save.
+4. In the browser, reload the page and rejoin.
+5. The tampered message now shows "✗ Invalid" in red — the server re-verifies
+   every signature on history load and never trusts a stored verdict.
+
+#### TOFU key binding
+- Join as `alice` in Browser A. Send a message. Note the fingerprint.
+- In Browser B (or incognito — different IndexedDB), attempt to join as `alice`.
+- Expect a `join-error`: "This username is registered to a different key."
+  Browser B cannot impersonate `alice` because it holds a different key pair.
+
 ## Automated tests
 
 ```bash
@@ -66,6 +96,9 @@ The database tests need `MONGODB_URI` set in `server/.env`. They run against a
 separate database (`csd_group_chat_test`) so they never touch the real chat
 data. Without a connection string they are skipped rather than failed, so the
 rest of the suite still runs.
+
+The **signature tests** (`server/test/signatures.test.js`) are pure crypto — no
+database or network required — so they always run.
 
 ## Acceptance criteria check
 
@@ -80,6 +113,31 @@ The app passes when all of the following are true:
 - someone joining late sees the messages sent before they arrived
 - reconnecting does not show the conversation twice
 - README instructions match the actual lab setup that worked
+- every message in the UI shows a signature trust badge ("✓ Signed", "✗ Invalid", or "· Unsigned")
+- manually editing a stored `ciphertext` or `signature` field in the DB makes that message show "✗ Invalid" after a reload
+- two different clients (different browsers or incognito windows) show different key fingerprints
+- no private key is ever transmitted — verify in the browser Network tab that no WebSocket frame contains private key material
+
+## ⚠️ Identity loss warning
+
+Each browser's ECDSA private key is stored in **IndexedDB** and is **non-extractable**.
+Clearing browser storage (Site Settings → Clear data, or clearing cookies/storage,
+or using a fresh browser profile) permanently destroys the private key.
+
+**Consequence:** After clearing storage, the browser generates a new key pair.
+The server's TOFU record still holds the **old** key for that username. Rejoining
+with the same username will produce:
+
+> "This username is registered to a different key."
+
+The user is effectively locked out of their username for the lifetime of the
+demo server. To recover, either:
+- Use a different username, **or**
+- A server admin deletes the document for that username from the `senders`
+  collection in Atlas (this resets the TOFU binding).
+
+**Call this out explicitly before the demo:** no one should clear browser storage
+during or between demo sessions.
 
 ## Suggested test record
 
@@ -89,6 +147,7 @@ Record a short note for each member:
 - machine used
 - time of join
 - message sent to test broadcast
+- key fingerprint observed (hover the badge)
 - result of disconnect/reconnect check
 
 This makes it easier to show the real verification work in the group report and PR description.

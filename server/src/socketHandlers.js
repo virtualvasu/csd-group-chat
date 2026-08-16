@@ -1,5 +1,7 @@
 const { validateUsername, validateMessage } = require('./validation');
 const { saveMessage, getHistory } = require('./db/messageRepository');
+const { findSender, registerSender } = require('./db/senderRepository');
+const { verifySignature, isTimestampFresh } = require('./crypto/signatures');
 
 // There is only one room for now. Every message is stored against this id, so
 // adding more rooms later is a matter of passing a real id through.
@@ -22,28 +24,78 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
   }
 
   // Reads the stored messages for the room and turns them into the shape the
-  // client expects. A database problem here should not stop someone joining,
-  // so the caller decides what to do if this throws.
+  // client expects.  Signatures are re-verified on every history load — we
+  // never trust a previously stored verdict, so manual edits to ciphertext or
+  // signature fields in the database are always caught.
   async function loadHistory() {
     const stored = await getHistory(ROOM_ID);
 
-    return stored.map((message) => ({
-      id: message.id,
-      username: message.senderId,
-      text: message.ciphertext.toString('utf8'),
-      timestamp: message.timestamp.getTime(),
-    }));
+    return Promise.all(
+      stored.map(async (message) => {
+        const text = message.ciphertext.toString('utf8');
+
+        let signatureStatus;
+        if (!message.signature || !message.senderPublicKey) {
+          signatureStatus = 'unsigned';
+        } else {
+          const sigB64 = message.signature.toString('base64');
+          const keyB64 = message.senderPublicKey.toString('base64');
+          const valid = await verifySignature(
+            message.senderId,
+            message.clientTimestamp ?? message.timestamp.getTime(),
+            text,
+            sigB64,
+            keyB64
+          );
+          signatureStatus = valid ? 'valid' : 'invalid';
+        }
+
+        return {
+          id: message.id,
+          username: message.senderId,
+          text,
+          timestamp: message.timestamp.getTime(),
+          signature: signatureStatus,
+          senderPublicKey: message.senderPublicKey
+            ? message.senderPublicKey.toString('base64')
+            : null,
+        };
+      })
+    );
   }
 
   socket.on(
     'join',
-    safeHandler(async (rawUsername) => {
+    safeHandler(async (rawPayload) => {
       if (socket.data.username) return; // already joined
+
+      // Accept both new shape { username, publicKey } and legacy bare string.
+      let rawUsername;
+      let publicKey = null;
+
+      if (rawPayload && typeof rawPayload === 'object') {
+        rawUsername = rawPayload.username;
+        publicKey = typeof rawPayload.publicKey === 'string' ? rawPayload.publicKey : null;
+      } else {
+        rawUsername = rawPayload; // bare string — backward compat
+      }
 
       const result = validateUsername(rawUsername);
       if (!result.valid) {
         socket.emit('join-error', { message: result.reason });
         return;
+      }
+
+      // Trust-on-first-use identity check.
+      // Only enforced when the client sends a public key.
+      if (publicKey) {
+        const existing = await findSender(result.username);
+        if (existing && existing.publicKey !== publicKey) {
+          socket.emit('join-error', {
+            message: 'This username is registered to a different key. Clear your stored identity or choose a different username.',
+          });
+          return;
+        }
       }
 
       // Usernames are unique per server, so a second tab using the same name
@@ -61,6 +113,12 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
 
       presence.add(socket.id, result.username);
       socket.data.username = result.username;
+      socket.data.publicKey = publicKey; // may be null for legacy clients
+
+      // Record the public key the first time this username joins.
+      if (publicKey) {
+        await registerSender(result.username, publicKey);
+      }
 
       socket.emit('join-success', { username: result.username });
 
@@ -83,7 +141,7 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
 
   socket.on(
     'chat-message',
-    safeHandler(async (rawText) => {
+    safeHandler(async (rawPayload) => {
       const username = socket.data.username;
       if (!username) {
         socket.emit('message-error', { message: 'You must join before sending messages.' });
@@ -95,28 +153,81 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         return;
       }
 
+      // Accept both new shape { text, timestamp, signature } and legacy bare string.
+      let rawText;
+      let clientTimestamp = null;
+      let signatureB64 = null;
+
+      if (rawPayload && typeof rawPayload === 'object') {
+        rawText = rawPayload.text;
+        clientTimestamp = typeof rawPayload.timestamp === 'number' ? rawPayload.timestamp : null;
+        signatureB64 = typeof rawPayload.signature === 'string' ? rawPayload.signature : null;
+      } else {
+        rawText = rawPayload; // bare string — backward compat, treated as unsigned
+      }
+
       const result = validateMessage(rawText);
       if (!result.valid) {
         socket.emit('message-error', { message: result.reason });
         return;
       }
 
+      const publicKey = socket.data.publicKey ?? null;
+
+      // Signature handling.
+      let signatureStatus = 'unsigned';
+
+      if (publicKey && signatureB64 && clientTimestamp !== null) {
+        // Anti-replay: reject timestamps that are too far from server time.
+        if (!isTimestampFresh(clientTimestamp)) {
+          socket.emit('message-error', {
+            message: 'Message timestamp is too far from server time. Please check your clock.',
+          });
+          return;
+        }
+
+        const valid = await verifySignature(
+          username,
+          clientTimestamp,
+          result.text,
+          signatureB64,
+          publicKey
+        );
+
+        if (!valid) {
+          socket.emit('message-error', { message: 'Signature verification failed. Message rejected.' });
+          return;
+        }
+
+        signatureStatus = 'valid';
+      }
+
       // Store first, then send it out. That way anything a client receives is
       // already saved, and the broadcast can carry the id the message was
       // stored under.
-      const timestamp = new Date();
+      //
+      // The server records its own timestamp for the stored record.
+      // Signature verification used the *client's* claimed timestamp.
+      const serverTimestamp = new Date();
+
       const id = await saveMessage({
         roomId: ROOM_ID,
         senderId: username,
         ciphertext: Buffer.from(result.text, 'utf8'),
-        timestamp,
+        timestamp: serverTimestamp,
+        // Store the client timestamp so history re-verification can use it.
+        clientTimestamp: clientTimestamp ?? serverTimestamp.getTime(),
+        signature: signatureB64 ? Buffer.from(signatureB64, 'base64') : null,
+        senderPublicKey: publicKey ? Buffer.from(publicKey, 'base64') : null,
       });
 
       io.emit('chat-message', {
         id,
         username,
         text: result.text,
-        timestamp: timestamp.getTime(),
+        timestamp: serverTimestamp.getTime(),
+        signature: signatureStatus,
+        senderPublicKey: publicKey,
       });
     })
   );

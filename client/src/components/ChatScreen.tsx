@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MessageTrustBadge } from "@/components/MessageTrustBadge";
 import { cn } from "@/lib/utils";
 import { colorForUser } from "@/lib/userColor";
 import type { ConnectionStatus, TimelineItem } from "@/types";
@@ -167,6 +168,11 @@ export function ChatScreen({
                     <span className="font-mono text-[0.7rem] text-mist">
                       {formatTime(item.timestamp)}
                     </span>
+                    {/* Signature trust badge — shown beside the timestamp */}
+                    <MessageTrustBadge
+                      status={item.signature}
+                      senderPublicKey={item.senderPublicKey}
+                    />
                   </span>
                 )}
                 <p

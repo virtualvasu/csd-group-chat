@@ -1,5 +1,8 @@
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
+/** The three possible signature verdicts the server emits. */
+export type SignatureStatus = "valid" | "invalid" | "unsigned";
+
 export interface ChatMessageItem {
   kind: "chat";
   id: string;
@@ -8,6 +11,10 @@ export interface ChatMessageItem {
   timestamp: number;
   own: boolean;
   grouped: boolean;
+  /** ECDSA signature verdict from the server. */
+  signature: SignatureStatus;
+  /** base64 SPKI public key of the sender, or null for unsigned messages. */
+  senderPublicKey: string | null;
 }
 
 export interface SystemMessageItem {
@@ -30,4 +37,8 @@ export interface ServerMessage {
   username: string;
   text: string;
   timestamp: number;
+  /** ECDSA signature verdict. */
+  signature: SignatureStatus;
+  /** base64 SPKI public key, or null for unsigned messages. */
+  senderPublicKey: string | null;
 }
