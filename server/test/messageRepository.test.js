@@ -91,12 +91,26 @@ test('messages from another room are not returned', { skip }, async () => {
   assert.deepEqual(textsOf(history), ['in main']);
 });
 
-test('the fields used later for encryption and signing default to empty', { skip }, async () => {
-  await saveAll(['plain for now']);
+test('the fields used later for signing default to empty', { skip }, async () => {
+  await saveAll(['no signature yet']);
 
   const [message] = await getHistory(ROOM);
 
-  assert.equal(message.nonce, null);
   assert.equal(message.signature, null);
   assert.equal(message.senderPublicKey, null);
+});
+
+test('the nonce is stored and returned alongside the message', { skip }, async () => {
+  const nonce = Buffer.from('0123456789ab', 'utf8');
+
+  await saveMessage({
+    roomId: ROOM,
+    senderId: 'Asha',
+    ciphertext: Buffer.from('some bytes', 'utf8'),
+    nonce,
+  });
+
+  const [message] = await getHistory(ROOM);
+
+  assert.deepEqual(message.nonce, nonce);
 });
