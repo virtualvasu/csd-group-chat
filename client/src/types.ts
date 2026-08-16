@@ -1,9 +1,21 @@
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
-// How much a message can be trusted. Only failed integrity checks are reported
-// today; signature states join this union later and MessageTrustBadge renders
-// whatever is in it.
-export type TrustStatus = "failed";
+// How much a message can be trusted. Two separate questions are answered per
+// message, and they are kept apart because they can disagree: a message can
+// decrypt perfectly and still carry a signature from the wrong key.
+
+// Whether the stored copy still matches its authentication tag. Only the
+// failure is reported — a message that is fine carries no integrity field.
+export type IntegrityStatus = "failed";
+
+// Whether the sender's ECDSA signature verifies over the message text.
+// "unsigned" means none was supplied, which is what messages from before
+// signing existed look like. "unknown" means the message did not decrypt, so
+// there is no plaintext left to check a signature against.
+export type SignatureStatus = "valid" | "invalid" | "unsigned" | "unknown";
+
+// What MessageTrustBadge can render. Either verdict can be handed to it.
+export type TrustStatus = SignatureStatus | IntegrityStatus;
 
 export interface ChatMessageItem {
   kind: "chat";
@@ -15,7 +27,12 @@ export interface ChatMessageItem {
   timestamp: number;
   own: boolean;
   grouped: boolean;
-  integrity?: TrustStatus;
+  /** ECDSA signature verdict from the server. */
+  signature: SignatureStatus;
+  /** base64 SPKI public key of the sender, or null for unsigned messages. */
+  senderPublicKey: string | null;
+  /** Present only when the stored copy failed its integrity check. */
+  integrity?: IntegrityStatus;
 }
 
 export interface SystemMessageItem {
@@ -38,5 +55,10 @@ export interface ServerMessage {
   username: string;
   text: string | null;
   timestamp: number;
-  integrity?: TrustStatus;
+  /** ECDSA signature verdict. */
+  signature: SignatureStatus;
+  /** base64 SPKI public key, or null for unsigned messages. */
+  senderPublicKey: string | null;
+  /** Present only when the stored copy failed its integrity check. */
+  integrity?: IntegrityStatus;
 }

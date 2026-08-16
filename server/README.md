@@ -12,7 +12,10 @@ server/
     routes/health.js          GET /health liveness endpoint
     db/index.js               MongoDB connection lifecycle (connect / getDb / close) and index setup
     db/messageRepository.js    All message queries: saveMessage + getHistory
-    crypto/messageCipher.js     AES-256-GCM encrypt / decrypt and the key loaded at startup
+    db/senderRepository.js    TOFU identity store: first-seen public key per username
+    crypto/messageCipher.js   AES-256-GCM encrypt / decrypt and the key loaded at startup
+    crypto/canonical.js       Canonical signing payload builder (counterpart: client/src/lib/canonical.ts)
+    crypto/signatures.js      ECDSA P-256 verification + anti-replay timestamp check
   scripts/
     generate-key.js           Prints a fresh CHAT_ENCRYPTION_KEY
     tamper-demo.js            Flips a bit in the newest stored message, for the tamper-detection demo
@@ -43,7 +46,7 @@ startup error rather than a surprise on the first message.
 
 ## Storage
 
-Messages live in the `messages` collection:
+### `messages` collection
 
 | Field | Type | Notes |
 |---|---|---|
@@ -52,17 +55,32 @@ Messages live in the `messages` collection:
 | `senderId` | string | The username that sent the message |
 | `ciphertext` | Binary | The encrypted message, with the 16-byte authentication tag on the end |
 | `nonce` | Binary | The 12-byte nonce this message was encrypted with |
-| `signature` | Binary \| null | Unused for now; reserved for message signing |
-| `senderPublicKey` | Binary \| null | Unused for now; reserved for message signing |
-| `timestamp` | Date | When the server accepted the message |
+| `signature` | Binary \| null | Base64-decoded ECDSA signature bytes from the client; null for unsigned messages |
+| `senderPublicKey` | Binary \| null | Base64-decoded SPKI public key bytes from the client; null for unsigned messages |
+| `timestamp` | Date | When the **server** accepted the message |
+| `clientTimestamp` | number | The **client's** claimed timestamp (ms since epoch); used when re-verifying signatures on history load |
 
 Only the message body is encrypted. The sender, the room and the timestamp are
 stored as they are, because history is read and sorted by them.
 
 Index: `{ roomId: 1, _id: 1 }`, matching how history is read (one room, in order).
 
-Every query lives in `db/messageRepository.js`. The socket handlers call
-`saveMessage` and `getHistory` and never touch the collection directly.
+### `senders` collection (new — Issue #14)
+
+Stores the first public key seen for each username (Trust-on-first-use / TOFU).
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | string | Lowercased username |
+| `publicKey` | string | Base64 SPKI public key from the first join |
+| `firstSeen` | Date | Timestamp of the first join |
+
+A later join that presents a **different** key for the same username is rejected
+with `join-error`. Sending no key at all (legacy/unsigned client) is still
+allowed — those messages are marked `unsigned`.
+
+Every query lives in `db/messageRepository.js` and `db/senderRepository.js`.
+The socket handlers call those functions and never touch collections directly.
 
 ### History ordering
 
@@ -137,8 +155,8 @@ Liveness check. Returns:
 
 | Event | Payload | Behavior |
 |---|---|---|
-| `join` | `username: string` | Validates and registers the username. Emits `join-success`, then `chat-history`, back to the sender. Emits `join-error` if the name is invalid or taken. Ignored if the socket has already joined. |
-| `chat-message` | `text: string` | Requires a prior successful `join`. Subject to rate limiting (5 messages / 3s per socket) and length/emptiness validation. Emits `message-error` back to the sender on rejection. |
+| `join` | `{ username: string, publicKey: string } \| string` | Validates and registers the username. New shape carries the sender's SPKI public key (base64). A bare string is accepted for backward compatibility with stale tabs — those sockets can still join, but messages they send will be marked `unsigned`. Emits `join-success`, then `chat-history`, back to the sender. Emits `join-error` if the name is invalid, taken, or if the supplied key differs from the one already registered for that username (TOFU). Ignored if the socket has already joined. |
+| `chat-message` | `{ text: string, timestamp: number, signature: string } \| string` | Requires a prior successful `join`. New shape includes the client-side ECDSA signature (base64) over the canonical payload and the client's claimed timestamp. A bare string is accepted for backward compatibility — treated as unsigned. Subject to rate limiting (5 messages / 3s per socket) and length/emptiness validation. Anti-replay: rejects a `timestamp` more than 60 s from the server clock. Emits `message-error` back to the sender on rejection. The message is **never stored** if the signature is invalid. |
 | `typing` | `isTyping: boolean` | Requires a prior successful `join`. Relays the sender's typing state to the other clients as `user-typing`. Ignored (silently) if the socket has not joined. |
 
 ### Server → Client
@@ -146,15 +164,15 @@ Liveness check. Returns:
 | Event | Payload | Sent to |
 |---|---|---|
 | `join-success` | `{ username }` | The joining socket only |
-| `join-error` | `{ message }` | The joining socket only (invalid username, duplicate username) |
-| `message-error` | `{ message }` | The sending socket only (not joined, rate-limited, invalid text) |
+| `join-error` | `{ message }` | The joining socket only (invalid username, duplicate username, TOFU key mismatch) |
+| `message-error` | `{ message }` | The sending socket only (not joined, rate-limited, invalid text, bad signature, stale timestamp) |
 | `server-error` | `{ message }` | The socket that triggered an unexpected server-side error |
 | `user-joined` | `{ username, timestamp }` | Everyone except the joining socket |
 | `user-left` | `{ username, timestamp }` | Everyone except the disconnecting socket |
 | `user-typing` | `{ username, isTyping }` | Everyone except the typing socket |
 | `online-users` | `string[]` | Everyone, after any join/leave |
-| `chat-history` | `{ id, username, text, timestamp, integrity? }[]` | The joining socket only, right after `join-success` |
-| `chat-message` | `{ id, username, text, timestamp }` | Everyone, including the sender |
+| `chat-history` | `{ id, username, text, timestamp, signature, senderPublicKey, integrity? }[]` | The joining socket only, right after `join-success` |
+| `chat-message` | `{ id, username, text, timestamp, signature, senderPublicKey }` | Everyone, including the sender |
 
 `integrity` appears in `chat-history` only, and only on a message whose stored
 copy failed its authentication check. It is then `'failed'` and `text` is `null`,
@@ -165,6 +183,31 @@ received, so there is nothing to verify yet.
 `id` is the message's MongoDB `_id` as a 24-character hex string. The same id is
 used in `chat-history` and `chat-message`, so a client can tell that a message it
 already has and one arriving in history are the same message.
+
+`signature` is one of `'valid' | 'invalid' | 'unsigned'`:
+- `valid` — the server verified the ECDSA signature before storing the message.
+- `invalid` — re-verification on history load failed (message or signature was tampered with).
+- `unsigned` — no signature was provided (legacy/stale client).
+
+`senderPublicKey` is the base64 SPKI public key of the sender, or `null` for unsigned messages.
+
+## Signature verification
+
+Signatures are verified **twice**:
+
+1. **On send** — before the message is stored. An invalid signature returns a
+   `message-error` and the message never reaches the database.
+2. **On history load** — every stored message is re-verified against its stored
+   public key each time a client joins. A stored verdict is never trusted;
+   tampering with `ciphertext` or `signature` in the database will be detected.
+
+The signing payload is byte-for-byte identical on both sides:
+
+```
+<username>\n<clientTimestamp>\n<text>   (UTF-8, no trailing newline)
+```
+
+See `server/src/crypto/canonical.js` and `client/src/lib/canonical.ts`.
 
 ## Chat history
 
@@ -191,6 +234,7 @@ already saved, and the broadcast can carry the id it was stored under.
 - **Username:** 1-20 characters, letters/numbers/spaces/`_`/`-` only, must not already be online (case-insensitive).
 - **Message:** non-empty after trimming, truncated to 500 characters.
 - **Rate limit:** max 5 `chat-message` events per rolling 3-second window per socket.
+- **Timestamp:** client-supplied timestamp must be within 60 seconds of the server clock (anti-replay).
 
 ## Typing state
 
@@ -204,7 +248,7 @@ follows its disconnect.
 
 **A username can only be online once — the second tab is blocked.** Opening a
 second tab and joining with a name that is already online gets a `join-error`
-("...already taken. It may be open in another tab.") and stays on the join
+(\"...already taken. It may be open in another tab.\") and stays on the join
 screen. A different username in the second tab is treated as a separate user.
 
 This falls out of the case-insensitive uniqueness check in `presence.js` and

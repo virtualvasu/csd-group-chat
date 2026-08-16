@@ -168,6 +168,15 @@ export function ChatScreen({
                     <span className="font-mono text-[0.7rem] text-mist">
                       {formatTime(item.timestamp)}
                     </span>
+                    {/* Who sent this. Left off when the message failed its
+                        integrity check, because the verdict there is only ever
+                        "unknown" and the block below already says so. */}
+                    {!item.integrity && (
+                      <MessageTrustBadge
+                        status={item.signature}
+                        senderPublicKey={item.senderPublicKey}
+                      />
+                    )}
                   </span>
                 )}
                 {item.integrity ? (
