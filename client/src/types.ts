@@ -1,13 +1,21 @@
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
+// How much a message can be trusted. Only failed integrity checks are reported
+// today; signature states join this union later and MessageTrustBadge renders
+// whatever is in it.
+export type TrustStatus = "failed";
+
 export interface ChatMessageItem {
   kind: "chat";
   id: string;
   username: string;
-  text: string;
+  // Null when the server could not recover the text, which happens when the
+  // stored message failed its integrity check.
+  text: string | null;
   timestamp: number;
   own: boolean;
   grouped: boolean;
+  integrity?: TrustStatus;
 }
 
 export interface SystemMessageItem {
@@ -28,6 +36,7 @@ export type StoredItem = Omit<ChatMessageItem, "grouped"> | SystemMessageItem;
 export interface ServerMessage {
   id: string;
   username: string;
-  text: string;
+  text: string | null;
   timestamp: number;
+  integrity?: TrustStatus;
 }
