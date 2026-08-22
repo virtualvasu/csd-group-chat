@@ -66,7 +66,19 @@ export function useChatSocket() {
   }, []);
 
   useEffect(() => {
-    const socket = io({ reconnectionDelay: 500, reconnectionDelayMax: 3000 });
+    // WebSocket-only, not the default polling-then-upgrade: behind a
+    // round-robin load balancer with multiple backend instances, a
+    // polling session's follow-up requests can land on a different
+    // instance than the one that issued its session id, which rejects
+    // them ("unknown session", surfaced as 400s on /socket.io/). A single
+    // WebSocket upgrade request stays pinned to whichever one backend
+    // handled it for the connection's whole lifetime, which sidesteps
+    // that entirely.
+    const socket = io({
+      transports: ["websocket"],
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 3000,
+    });
     socketRef.current = socket;
 
     // Start loading the identity eagerly so it is ready by the time the user
