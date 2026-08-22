@@ -269,6 +269,8 @@ func main() {
 	healthTimeout := flag.Duration("health-timeout", 800*time.Millisecond, "timeout for a single health check request")
 	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond, "timeout waiting for a backend's response headers")
 	dialTimeout := flag.Duration("dial-timeout", 800*time.Millisecond, "timeout connecting to a backend")
+	tlsCert := flag.String("tls-cert", "", "path to a TLS certificate file; if set with -tls-key, serve HTTPS instead of plain HTTP")
+	tlsKey := flag.String("tls-key", "", "path to the TLS certificate's private key file")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -332,6 +334,18 @@ func main() {
 	}
 
 	go lb.healthLoop(*healthInterval, *healthTimeout)
+
+	// TLS terminates here, at the load balancer, and traffic to the
+	// backends stays plain HTTP — the browser only needs a secure context
+	// (required for the chat client's Web Crypto signing keys) up to this
+	// edge, and the backends are all on the same trusted internal network.
+	if *tlsCert != "" && *tlsKey != "" {
+		log.Printf("load balancer listening on %s (TLS), backends: %v", *listenAddr, *backendsFlag)
+		if err := http.ListenAndServeTLS(*listenAddr, *tlsCert, *tlsKey, lb); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	log.Printf("load balancer listening on %s, backends: %v", *listenAddr, *backendsFlag)
 	if err := http.ListenAndServe(*listenAddr, lb); err != nil {
