@@ -8,9 +8,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -90,22 +92,25 @@ type LoadBalancer struct {
 	metrics  *Metrics
 }
 
-// nextBackend walks the backend list starting from the shared cursor and
-// returns the first healthy one. It never loops more than once around the
-// list, so an all-unhealthy pool returns nil instead of spinning forever.
-func (lb *LoadBalancer) nextBackend() *Backend {
+// candidateBackends returns every currently-healthy backend, starting from
+// the shared round-robin cursor and wrapping around once. Callers try them
+// in this order, falling through to the next one if a request fails, so a
+// single backend erroring out under load does not fail the request outright
+// as long as another healthy backend exists.
+func (lb *LoadBalancer) candidateBackends() []*Backend {
 	n := len(lb.backends)
 	if n == 0 {
 		return nil
 	}
+	start := int(lb.next.Add(1) % uint64(n))
+	candidates := make([]*Backend, 0, n)
 	for i := 0; i < n; i++ {
-		index := lb.next.Add(1) % uint64(n)
-		b := lb.backends[index]
+		b := lb.backends[(start+i)%n]
 		if b.Alive.Load() {
-			return b
+			candidates = append(candidates, b)
 		}
 	}
-	return nil
+	return candidates
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -125,21 +130,52 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	lb.metrics.Total.Add(1)
 
-	backend := lb.nextBackend()
-	if backend == nil {
+	candidates := lb.candidateBackends()
+	if len(candidates) == 0 {
 		lb.metrics.Failed.Add(1)
 		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
 		return
 	}
 
-	backend.InFlight.Add(1)
-	defer backend.InFlight.Add(-1)
+	// Buffer the request body once (it is a stream and can only be read a
+	// single time) so it can be replayed if the first backend tried fails
+	// before we've committed a response, letting us retry against the next
+	// healthy candidate instead of failing the whole request.
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+	}
 
 	start := time.Now()
-	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-	backend.proxy.ServeHTTP(rec, r)
+	var rec *statusRecorder
+	for _, backend := range candidates {
+		if bodyBytes != nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+		}
+
+		backend.InFlight.Add(1)
+		rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		backend.proxy.ServeHTTP(rec, r)
+		backend.InFlight.Add(-1)
+
+		if !rec.failed {
+			break
+		}
+		// This backend's ErrorHandler marked the attempt failed without
+		// writing anything to the client (see below) — safe to retry the
+		// next candidate. Once a response has actually started streaming to
+		// the client this loop is not reached again, since ServeHTTP has
+		// already returned by then.
+	}
 	lb.metrics.record(time.Since(start))
 
+	if rec.failed {
+		lb.metrics.Failed.Add(1)
+		http.Error(w, "all backends unavailable", http.StatusBadGateway)
+		return
+	}
 	if rec.status >= 500 {
 		lb.metrics.Failed.Add(1)
 	} else {
@@ -168,7 +204,10 @@ func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 }
 
 // statusRecorder captures the status code the backend responded with, since
-// the standard ResponseWriter does not expose it after the fact.
+// the standard ResponseWriter does not expose it after the fact. It also
+// gives a backend's ErrorHandler a way to report failure (see below)
+// without writing to the real client, so LoadBalancer.ServeHTTP can retry a
+// different backend instead of the error being final.
 //
 // It forwards Hijack explicitly because embedding only promotes the methods
 // declared on the http.ResponseWriter interface itself; without this, the
@@ -178,6 +217,7 @@ func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	failed bool
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -267,14 +307,23 @@ func main() {
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = transport
 		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-			// Failed/Success are tallied once, from the response status,
-			// after ServeHTTP returns (see LoadBalancer.ServeHTTP) — this
-			// handler only needs to flip health state and count the
-			// backend-specific error, or the request would be double
-			// counted as failed.
+			// This fires for connection-establishment failures — dial
+			// errors, response-header timeouts — before any part of a
+			// response has been written to the real client. That means it
+			// is safe to leave rw untouched and let ServeHTTP's retry loop
+			// try the next healthy backend instead of failing the request
+			// outright. (It is only ever unsafe to retry after headers have
+			// already been committed to the client, which is not the case
+			// here — see the retry loop in LoadBalancer.ServeHTTP.)
 			b.Alive.Store(false)
 			lb.metrics.BackendErrors.Add(1)
 			log.Printf("backend %s error: %v", b.URL, err)
+			if rec, ok := rw.(*statusRecorder); ok {
+				rec.failed = true
+				return
+			}
+			// Should not normally happen — ServeHTTP always passes a
+			// *statusRecorder — but fail safe rather than hang the client.
 			http.Error(rw, "backend unavailable", http.StatusBadGateway)
 		}
 		b.proxy = proxy
