@@ -4,3 +4,10 @@ node_modules/
 package-lock.json
 ISSUES.md
 Lab 4.pdf
+
+# Built binaries and generated experiment output — not source.
+loadgen/loadgen
+loadgen/loadgen.exe
+loadgen/results/
+loadbalancer/lb
+loadbalancer/lb.exe
