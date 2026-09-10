@@ -170,56 +170,111 @@ func (lb *LoadBalancer) totalInFlight() int64 {
 	return total
 }
 
-// cpuPercent reports how busy this machine has been since the last call.
+// cpuPercent reports how much of this container's CPU entitlement is in use.
 //
-// /proc/stat counts jiffies per state since boot, so a single reading says
-// nothing on its own — the busy fraction is the change between two readings.
-// Returns 0 where /proc is not available, which keeps this harmless when the
-// balancer is run on a development machine rather than on the lab system.
+// /proc/stat is not namespaced, so inside a container it describes the host —
+// on the lab machine, all 120 of its cores. A balancer saturating its single
+// allotted CPU would show under 1% busy there, which is worthless both for
+// routing and for the utilisation figures in the report. The cgroup accounts
+// for this container specifically, so that is what gets read, expressed as a
+// percentage of the quota rather than of the host.
 var cpuState struct {
-	mu           sync.Mutex
-	lastIdle     uint64
-	lastTotal    uint64
-	lastReported float64
+	mu            sync.Mutex
+	lastUsageUsec uint64
+	lastAt        time.Time
+	lastReported  float64
+}
+
+// cgroupUsageMicros returns CPU microseconds consumed by this container.
+func cgroupUsageMicros() (uint64, bool) {
+	if data, err := os.ReadFile("/sys/fs/cgroup/cpu.stat"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			rest, found := strings.CutPrefix(line, "usage_usec ")
+			if !found {
+				continue
+			}
+			if value, err := strconv.ParseUint(strings.TrimSpace(rest), 10, 64); err == nil {
+				return value, true
+			}
+		}
+	}
+
+	// cgroup v1 reports nanoseconds.
+	if data, err := os.ReadFile("/sys/fs/cgroup/cpuacct/cpuacct.usage"); err == nil {
+		if value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			return value / 1000, true
+		}
+	}
+
+	return 0, false
+}
+
+// quotaCores is how many CPUs this container may use, i.e. what 100% means.
+func quotaCores() float64 {
+	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return float64(runtime.NumCPU())
+	}
+
+	fields := strings.Fields(strings.TrimSpace(string(data)))
+	if len(fields) != 2 || fields[0] == "max" {
+		return float64(runtime.NumCPU())
+	}
+
+	quota, err1 := strconv.ParseFloat(fields[0], 64)
+	period, err2 := strconv.ParseFloat(fields[1], 64)
+	if err1 != nil || err2 != nil || quota <= 0 || period <= 0 {
+		return float64(runtime.NumCPU())
+	}
+
+	return quota / period
+}
+
+var cores = quotaCores()
+
+// sampleCPU is called on a timer rather than from the request handler. Reading
+// it per request would measure whatever sliver of time had passed since the
+// last read, which for two closely spaced requests is noise rather than a
+// measurement.
+func sampleCPU() float64 {
+	cpuState.mu.Lock()
+	defer cpuState.mu.Unlock()
+
+	usage, ok := cgroupUsageMicros()
+	now := time.Now()
+
+	if !ok {
+		return cpuState.lastReported
+	}
+
+	if !cpuState.lastAt.IsZero() {
+		elapsedMicros := float64(now.Sub(cpuState.lastAt).Microseconds())
+		if elapsedMicros > 0 {
+			used := float64(usage - cpuState.lastUsageUsec)
+			percent := 100 * used / (elapsedMicros * cores)
+			cpuState.lastReported = math.Max(0, math.Min(100, percent))
+		}
+	}
+
+	cpuState.lastUsageUsec = usage
+	cpuState.lastAt = now
+
+	return cpuState.lastReported
 }
 
 func cpuPercent() float64 {
 	cpuState.mu.Lock()
 	defer cpuState.mu.Unlock()
-
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0
-	}
-
-	line, _, _ := strings.Cut(string(data), "\n")
-	if !strings.HasPrefix(line, "cpu ") {
-		return 0
-	}
-
-	var idle, total uint64
-	for i, field := range strings.Fields(line)[1:] {
-		value, err := strconv.ParseUint(field, 10, 64)
-		if err != nil {
-			continue
-		}
-		total += value
-		// Fields 3 and 4 are idle and iowait.
-		if i == 3 || i == 4 {
-			idle += value
-		}
-	}
-
-	idleDelta := idle - cpuState.lastIdle
-	totalDelta := total - cpuState.lastTotal
-	cpuState.lastIdle = idle
-	cpuState.lastTotal = total
-
-	if totalDelta > 0 {
-		cpuState.lastReported = 100 * (1 - float64(idleDelta)/float64(totalDelta))
-	}
-
 	return cpuState.lastReported
+}
+
+func startCPUSampling(interval time.Duration) {
+	go func() {
+		sampleCPU()
+		for range time.Tick(interval) {
+			sampleCPU()
+		}
+	}()
 }
 
 // Weights turn three different measurements into one comparable number.
@@ -316,10 +371,13 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// in the deployment with no utilisation figures.
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"cpuPercent": math.Round(cpuPercent()*100) / 100,
-			"goroutines": runtime.NumGoroutine(),
-			"cpuCount":   runtime.NumCPU(),
-			"inFlight":   lb.totalInFlight(),
+			// Percent of this container's entitlement, matching what the
+			// backends report, so the four systems are directly comparable.
+			"cpuPercent":   math.Round(cpuPercent()*100) / 100,
+			"cpuCores":     cores,
+			"hostCpuCount": runtime.NumCPU(),
+			"goroutines":   runtime.NumGoroutine(),
+			"inFlight":     lb.totalInFlight(),
 		})
 		return
 	}
@@ -724,6 +782,7 @@ func main() {
 
 	go lb.healthLoop(*healthInterval, *healthTimeout)
 	go lb.statsLoop(*statsInterval, *statsTimeout)
+	startCPUSampling(500 * time.Millisecond)
 
 	log.Printf(
 		"load balancer on %s | backends=%d threshold=%.2f weights(inflight=%.2f latency=%.3f cpu=%.2f) gomaxprocs=%d",
