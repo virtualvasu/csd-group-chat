@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -189,6 +190,43 @@ func applyCPUQuota() int {
 	// been ignored.
 	runtime.GOMAXPROCS(procs)
 	return procs
+}
+
+// applyMemoryLimit tells the garbage collector how much memory it may actually
+// use, which is not something it can otherwise find out.
+//
+// Go sizes collections against the live heap — roughly doubling it before
+// collecting — with no knowledge of any cgroup limit. This container is capped
+// at 512MB while the host reports 128GB, so left alone the runtime will happily
+// grow past the cap under load and the kernel will kill the process. That death
+// is silent: no panic, no message, the balancer simply stops existing, which is
+// exactly what happened during the evaluation.
+//
+// Setting a soft limit makes the collector work harder as it approaches the cap
+// instead of running into it. The headroom below the cgroup limit covers what
+// the heap limit does not: goroutine stacks, runtime structures and socket
+// buffers, all of which count against the container.
+func applyMemoryLimit() {
+	data, err := os.ReadFile("/sys/fs/cgroup/memory.max")
+	if err != nil {
+		return
+	}
+
+	text := strings.TrimSpace(string(data))
+	if text == "max" {
+		log.Printf("memory limit: unlimited")
+		return
+	}
+
+	limit, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || limit == 0 {
+		return
+	}
+
+	soft := int64(float64(limit) * 0.70)
+	debug.SetMemoryLimit(soft)
+	log.Printf("memory limit: cgroup %dMB, GC soft limit set to %dMB",
+		limit/(1<<20), soft/(1<<20))
 }
 
 func (lb *LoadBalancer) totalInFlight() int64 {
@@ -827,8 +865,9 @@ func main() {
 		log.Fatal("at least one -backends URL is required")
 	}
 
-	// Before anything opens a socket.
+	// Before anything opens a socket or allocates.
 	raiseFileLimit()
+	applyMemoryLimit()
 
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
