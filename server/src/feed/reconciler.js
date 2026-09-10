@@ -58,9 +58,9 @@ class Reconciler {
     const digest = await this.request(`${peer}/internal/digest`);
     const local = this.store.digest();
 
-    // Same number of messages and the same newest one: nothing to do. This is
+    // Same number of messages and the same set of ids: nothing to do. This is
     // the steady state, and it costs one small request per peer per round.
-    if (digest.count === local.count && digest.lastId === local.lastId) {
+    if (digest.count === local.count && digest.checksum === local.checksum) {
       return 0;
     }
 
