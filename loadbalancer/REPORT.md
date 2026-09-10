@@ -10,10 +10,14 @@
 
 | System | Role            | Address           |
 |--------|-----------------|-------------------|
-| Sys1   | Load Balancer   | 10.1.75.53:3265   |
-| Sys2   | Backend copy 1  | 10.1.75.53:3266   |
-| Sys3   | Backend copy 2  | 10.1.75.53:3267   |
-| Sys4   | Backend copy 3  | 10.1.75.53:3268   |
+| Sys1   | Load Balancer   | 10.1.75.53:4285 (HTTPS) |
+| Sys2   | Backend copy 1  | 10.1.75.53:4286   |
+| Sys3   | Backend copy 2  | 10.1.75.53:4287   |
+| Sys4   | Backend copy 3  | 10.1.75.53:4288   |
+
+All four are separate VMs sharing one physical host (`10.1.75.53`) — the
+system-utilization plot below shows near-identical CPU/memory curves across
+all 4 because of that shared-host contention, not a measurement error.
 
 ## Load Balancer Code
 
@@ -55,28 +59,71 @@ its load score.
 
 ### Threshold (`-max-inflight`)
 
-Default: `8` in-flight requests per backend. (Fill in after running loadgen:
-what value maximized throughput / minimized p95 without materially raising
-the dropout rate? Try a few values via `-max-inflight` against the CPU-bound
-`/lb-test` endpoint or `/message`, and record the comparison here.)
+Chosen value: **8** (the default). Determined by running the identical load
+profile (`loadgen -concurrency 25 -users 25 -feed-ratio 0.15`, see
+`loadgen/results/threshold-comparison.csv` and `loadgen/results/comparison.csv`
+row `medium-load-c25`) against the load balancer restarted at three different
+`-max-inflight` values:
 
-| `-max-inflight` | Throughput (rps) | p95 (ms) | Dropout % | Notes |
-|---|---|---|---|---|
-|   |   |   |   |   |
+| `-max-inflight` | Throughput (rps) | /message p95 (ms) | Dropout % |
+|---|---|---|---|
+| 4  | 8.3  | 3041.7 | 58.67% |
+| **8**  | **23.4** | **925.8**  | **19.87%** |
+| 16 | 11.0 | 3869.2 | 44.40% |
 
-## Comparison Table
+![Threshold comparison](../loadgen/results/plots/threshold_comparison.png)
 
-| Experiment    | Requests | Concurrency | Successful | Failed | RPS | Dropout % | p50 (ms) | p95 (ms) | p99 (ms) |
-|---------------|----------|-------------|------------|--------|-----|-----------|----------|----------|----------|
-| 1 backend (Sys2 only) |    |             |            |        |     |           |          |          |          |
-| 3 backends (Sys2+3+4) |    |             |            |        |     |           |          |          |          |
+8 is a clear sweet spot, not just "closer to the default is safer": too low
+(4) marks backends overloaded almost immediately without actually reducing
+the load reaching them (the threshold only reorders *preference*, it isn't
+admission control), so it buys nothing while still adding overhead; too high
+(16) lets one backend absorb too much before the load balancer reacts and
+starts preferring another. Both mistuned values roughly halve throughput and
+triple-plus the dropout rate relative to 8.
 
-(Fill this in from `results/single.json` and `results/three.json`, or from
-`results/comparison.csv` produced by `loadgen`.)
+## Response Time vs. Load
+
+Own `loadgen` (`loadgen/main.go`) run against the live load balancer URL at
+three concurrency levels, each with randomized message length, randomized
+inter-message interval per simulated user, and a mix of `/message` and
+`/feed` traffic (`-feed-ratio 0.15`). Full rows in
+`loadgen/results/comparison.csv`.
+
+| Experiment | Concurrency | Users | RPS | Dropout % | /message p50 (ms) | /message p95 (ms) | /feed p50 (ms) | /feed p95 (ms) |
+|---|---|---|---|---|---|---|---|---|
+| low-load-c10    | 10 | 10 | 12.8 | 0.00%  | 40.2 | 279.9  | 967.1  | 1508.7 |
+| medium-load-c25 | 25 | 25 | 23.4 | 19.87% | 47.5 | 925.8  | 1995.8 | 5001.3 |
+| higher-load-c50 | 50 | 50 | 17.1 | 54.13% | 69.7 | 4066.8 | 3004.9 | 5001.1 |
+
+![Response time vs load](../loadgen/results/plots/response_time.png)
 
 ### Observations
-- (fill in: throughput / dropout / latency differences between the two runs)
-- (fill in: what happened when a backend was killed mid-experiment, if tested)
+
+- **`/message` stays cheap at every load level tested** (p50 under 70ms even
+  at concurrency 50) — writes are fast because they're one encrypt + one
+  MongoDB insert.
+- **`/feed` is the actual bottleneck**, not backend selection. Its p50 grows
+  from ~1s to 3s+ across these runs because it decrypts and re-verifies the
+  signature of *every* stored message on every call — a cost that scales with
+  total chat history, not with request rate. Almost all dropout in these runs
+  is `/feed` requests hitting loadgen's 5s client timeout, visible in the
+  `context deadline exceeded` errors reported per run.
+- This means the dynamic load balancing is doing its job (spreading load
+  across healthy, least-loaded backends — see the threshold section above);
+  the remaining bottleneck at high concurrency is `/feed`'s per-request cost
+  on whichever backend serves it, independent of which backend that is.
+
+## System Utilization (all 4 systems)
+
+CPU and memory sampled once per second on all 4 systems throughout the load
+tests above, via `loadgen/monitor.sh` (raw `/proc` parsing, no dependencies).
+Raw data: `monitor_results/{lb,server1,server2,server3}`.
+
+![System utilization](../loadgen/results/plots/system_utilization.png)
+
+CPU spikes clearly track the load test windows (idle baseline ~1-2%, up to
+~15-19% during the concurrency-50 run); all 4 curves move together because
+these VMs share one physical host.
 
 ## Relevant Screenshots
 - [ ] `curl` output of `/lb/status` showing all three backends alive, with `in_flight`/`overloaded` fields

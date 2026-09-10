@@ -8,7 +8,8 @@ Lab 4.pdf
 # Built binaries and generated experiment output — not source.
 loadgen/loadgen
 loadgen/loadgen.exe
-loadgen/results/
+loadgen/.venv/
+loadgen/results/*.json
 loadbalancer/lb
 loadbalancer/lb.exe
 loadbalancer/loadbalancer
