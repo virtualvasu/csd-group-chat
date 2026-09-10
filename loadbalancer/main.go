@@ -130,6 +130,38 @@ func (m *Metrics) snapshot() map[string]any {
 	}
 }
 
+// applyCPUQuota keeps the Go runtime's idea of available parallelism in line
+// with what the container is actually entitled to.
+//
+// runtime.NumCPU() reports the host's cores — 120 on the lab machine — but the
+// cgroup quota here grants the equivalent of one. Left alone, Go would run 120
+// schedulable threads against that single CPU's worth of time, and the kernel
+// would throttle the whole process once the quota ran out inside each period.
+// The visible effect is latency spikes under exactly the load we care about.
+func applyCPUQuota() int {
+	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	fields := strings.Fields(strings.TrimSpace(string(data)))
+	if len(fields) != 2 || fields[0] == "max" {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	quota, err1 := strconv.ParseFloat(fields[0], 64)
+	period, err2 := strconv.ParseFloat(fields[1], 64)
+	if err1 != nil || err2 != nil || period <= 0 || quota <= 0 {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	// One spare thread above the entitlement, so a goroutine blocked in a
+	// syscall does not leave the quota unused, without inviting the thrashing
+	// that a much larger number would.
+	procs := int(quota/period) + 1
+	return runtime.GOMAXPROCS(procs)
+}
+
 func (lb *LoadBalancer) totalInFlight() int64 {
 	var total int64
 	for _, b := range lb.backends {
@@ -694,8 +726,9 @@ func main() {
 	go lb.statsLoop(*statsInterval, *statsTimeout)
 
 	log.Printf(
-		"load balancer on %s | backends=%d threshold=%.2f weights(inflight=%.2f latency=%.3f cpu=%.2f)",
+		"load balancer on %s | backends=%d threshold=%.2f weights(inflight=%.2f latency=%.3f cpu=%.2f) gomaxprocs=%d",
 		*listenAddr, len(lb.backends), lb.threshold, lb.weights.InFlight, lb.weights.Latency, lb.weights.CPU,
+		applyCPUQuota(),
 	)
 
 	if *tlsCert != "" && *tlsKey != "" {
