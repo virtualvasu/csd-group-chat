@@ -11,3 +11,5 @@ loadgen/loadgen.exe
 loadgen/results/
 loadbalancer/lb
 loadbalancer/lb.exe
+loadbalancer/loadbalancer
+loadbalancer/loadbalancer.exe

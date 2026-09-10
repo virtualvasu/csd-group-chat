@@ -36,6 +36,17 @@ type result struct {
 	P95Ms          float64 `json:"p95_ms"`
 	P99Ms          float64 `json:"p99_ms"`
 	ElapsedSeconds float64 `json:"elapsed_seconds"`
+
+	// Breakdown by route, since /message (write) and /feed (read) have very
+	// different cost profiles on the backend and the assignment requires both
+	// exact routes to be exercised, not just /message.
+	FeedRatio      float64 `json:"feed_ratio"`
+	MessageCount   uint64  `json:"message_count"`
+	MessageP50Ms   float64 `json:"message_p50_ms"`
+	MessageP95Ms   float64 `json:"message_p95_ms"`
+	FeedCount      uint64  `json:"feed_count"`
+	FeedP50Ms      float64 `json:"feed_p50_ms"`
+	FeedP95Ms      float64 `json:"feed_p95_ms"`
 }
 
 func percentile(sorted []time.Duration, p float64) time.Duration {
@@ -90,6 +101,7 @@ func main() {
 	maxMsgLen := flag.Int("max-msg-len", 200, "maximum random message length in characters")
 	minIntervalMs := flag.Int("min-interval-ms", 0, "minimum random per-worker delay before sending its next message, in ms")
 	maxIntervalMs := flag.Int("max-interval-ms", 500, "maximum random per-worker delay before sending its next message, in ms")
+	feedRatio := flag.Float64("feed-ratio", 0.1, "fraction of requests (0-1) that are GET /feed instead of POST /message, so both required routes are exercised")
 	timeout := flag.Duration("timeout", 5*time.Second, "per-request timeout")
 	experiment := flag.String("experiment", "run", "label for this experiment, used in output filenames/rows")
 	outPath := flag.String("out", "", "optional path to write a per-experiment JSON result file")
@@ -106,8 +118,12 @@ func main() {
 	if *minMsgLen <= 0 || *maxMsgLen <= 0 {
 		log.Fatal("-min-msg-len and -max-msg-len must be positive")
 	}
+	if *feedRatio < 0 || *feedRatio > 1 {
+		log.Fatal("-feed-ratio must be between 0 and 1")
+	}
 
 	messageURL := strings.TrimRight(*targetURL, "/") + "/message"
+	feedURL := strings.TrimRight(*targetURL, "/") + "/feed"
 
 	client := &http.Client{Timeout: *timeout}
 	if *insecure {
@@ -130,6 +146,8 @@ func main() {
 	var firstErrOnce sync.Once
 	var firstErr error
 	latencies := make([]time.Duration, 0, *requests)
+	messageLatencies := make([]time.Duration, 0, *requests)
+	feedLatencies := make([]time.Duration, 0, *requests)
 	var latMu sync.Mutex
 
 	var wg sync.WaitGroup
@@ -146,30 +164,50 @@ func main() {
 					time.Sleep(randomInterval(*minIntervalMs, *maxIntervalMs))
 				}
 
-				clientName := fmt.Sprintf("loadgen-user-%d", rand.Intn(*users))
-				msg := randomMessage(*minMsgLen, *maxMsgLen)
-				id := fmt.Sprintf("%d-%d-%d", workerID, time.Now().UnixNano(), rand.Int63())
+				isFeed := rand.Float64() < *feedRatio
 
-				body, _ := json.Marshal(map[string]string{
-					"client-name": clientName,
-					"msg":         msg,
-					"id":          id,
-				})
+				var reqErr error
+				var status int
+				var elapsed time.Duration
 
-				reqStart := time.Now()
-				resp, err := client.Post(messageURL, "application/json", bytes.NewReader(body))
-				elapsed := time.Since(reqStart)
+				if isFeed {
+					reqStart := time.Now()
+					resp, err := client.Get(feedURL)
+					elapsed = time.Since(reqStart)
+					reqErr = err
+					if resp != nil {
+						_, _ = discard(resp)
+						status = resp.StatusCode
+						resp.Body.Close()
+					}
+				} else {
+					clientName := fmt.Sprintf("loadgen-user-%d", rand.Intn(*users))
+					msg := randomMessage(*minMsgLen, *maxMsgLen)
+					id := fmt.Sprintf("%d-%d-%d", workerID, time.Now().UnixNano(), rand.Int63())
 
-				ok := err == nil
-				if err != nil {
-					firstErrOnce.Do(func() { firstErr = err })
+					body, _ := json.Marshal(map[string]string{
+						"client-name": clientName,
+						"msg":         msg,
+						"id":          id,
+					})
+
+					reqStart := time.Now()
+					resp, err := client.Post(messageURL, "application/json", bytes.NewReader(body))
+					elapsed = time.Since(reqStart)
+					reqErr = err
+					if resp != nil {
+						// Drain and close so the connection can be reused by
+						// the client's transport instead of piling up new
+						// dials.
+						_, _ = discard(resp)
+						status = resp.StatusCode
+						resp.Body.Close()
+					}
 				}
-				if resp != nil {
-					// Drain and close so the connection can be reused by the
-					// client's transport instead of piling up new dials.
-					_, _ = discard(resp)
-					ok = ok && resp.StatusCode >= 200 && resp.StatusCode < 400
-					resp.Body.Close()
+
+				ok := reqErr == nil && status >= 200 && status < 400
+				if reqErr != nil {
+					firstErrOnce.Do(func() { firstErr = reqErr })
 				}
 
 				if ok {
@@ -180,6 +218,11 @@ func main() {
 
 				latMu.Lock()
 				latencies = append(latencies, elapsed)
+				if isFeed {
+					feedLatencies = append(feedLatencies, elapsed)
+				} else {
+					messageLatencies = append(messageLatencies, elapsed)
+				}
 				latMu.Unlock()
 			}
 		}(w)
@@ -189,6 +232,8 @@ func main() {
 	elapsed := time.Since(start)
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	sort.Slice(messageLatencies, func(i, j int) bool { return messageLatencies[i] < messageLatencies[j] })
+	sort.Slice(feedLatencies, func(i, j int) bool { return feedLatencies[i] < feedLatencies[j] })
 	toMs := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 
 	succ := successful.Load()
@@ -208,6 +253,13 @@ func main() {
 		P95Ms:          toMs(percentile(latencies, 0.95)),
 		P99Ms:          toMs(percentile(latencies, 0.99)),
 		ElapsedSeconds: elapsed.Seconds(),
+		FeedRatio:      *feedRatio,
+		MessageCount:   uint64(len(messageLatencies)),
+		MessageP50Ms:   toMs(percentile(messageLatencies, 0.50)),
+		MessageP95Ms:   toMs(percentile(messageLatencies, 0.95)),
+		FeedCount:      uint64(len(feedLatencies)),
+		FeedP50Ms:      toMs(percentile(feedLatencies, 0.50)),
+		FeedP95Ms:      toMs(percentile(feedLatencies, 0.95)),
 	}
 
 	printSummary(r)
@@ -241,10 +293,12 @@ func discard(resp *http.Response) (int64, error) {
 }
 
 func printSummary(r result) {
-	fmt.Printf("experiment=%s requests=%d concurrency=%d users=%d\n", r.Experiment, r.Requests, r.Concurrency, r.Users)
+	fmt.Printf("experiment=%s requests=%d concurrency=%d users=%d feed_ratio=%.2f\n", r.Experiment, r.Requests, r.Concurrency, r.Users, r.FeedRatio)
 	fmt.Printf("  successful=%d failed=%d dropout=%.2f%%\n", r.Successful, r.Failed, r.DropoutPercent)
 	fmt.Printf("  throughput=%.1f rps  (elapsed %.2fs)\n", r.ThroughputRPS, r.ElapsedSeconds)
-	fmt.Printf("  p50=%.1fms p95=%.1fms p99=%.1fms\n", r.P50Ms, r.P95Ms, r.P99Ms)
+	fmt.Printf("  overall  p50=%.1fms p95=%.1fms p99=%.1fms\n", r.P50Ms, r.P95Ms, r.P99Ms)
+	fmt.Printf("  /message n=%d p50=%.1fms p95=%.1fms\n", r.MessageCount, r.MessageP50Ms, r.MessageP95Ms)
+	fmt.Printf("  /feed    n=%d p50=%.1fms p95=%.1fms\n", r.FeedCount, r.FeedP50Ms, r.FeedP95Ms)
 }
 
 func writeJSON(path string, r result) {
@@ -263,6 +317,8 @@ func writeJSON(path string, r result) {
 var csvHeader = []string{
 	"experiment", "requests", "concurrency", "users", "successful", "failed",
 	"throughput_rps", "dropout_percent", "p50_ms", "p95_ms", "p99_ms", "elapsed_seconds",
+	"feed_ratio", "message_count", "message_p50_ms", "message_p95_ms",
+	"feed_count", "feed_p50_ms", "feed_p95_ms",
 }
 
 func appendCSV(path string, r result) {
@@ -297,6 +353,13 @@ func appendCSV(path string, r result) {
 		fmt.Sprintf("%.2f", r.P95Ms),
 		fmt.Sprintf("%.2f", r.P99Ms),
 		fmt.Sprintf("%.2f", r.ElapsedSeconds),
+		fmt.Sprintf("%.2f", r.FeedRatio),
+		fmt.Sprint(r.MessageCount),
+		fmt.Sprintf("%.2f", r.MessageP50Ms),
+		fmt.Sprintf("%.2f", r.MessageP95Ms),
+		fmt.Sprint(r.FeedCount),
+		fmt.Sprintf("%.2f", r.FeedP50Ms),
+		fmt.Sprintf("%.2f", r.FeedP95Ms),
 	}
 	if err := w.Write(row); err != nil {
 		log.Fatalf("could not write CSV row: %v", err)
