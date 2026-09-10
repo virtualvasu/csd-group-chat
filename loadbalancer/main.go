@@ -101,6 +101,21 @@ func (m *Metrics) record(d time.Duration) {
 	m.latencies = append(m.latencies, d)
 }
 
+// Clears the counters between tuning runs so each threshold is measured on its
+// own traffic rather than on everything since the process started.
+func (m *Metrics) reset() {
+	m.Total.Store(0)
+	m.Success.Store(0)
+	m.Failed.Store(0)
+	m.BackendErrors.Store(0)
+	m.Switches.Store(0)
+	m.Retries.Store(0)
+
+	m.mu.Lock()
+	m.latencies = m.latencies[:0]
+	m.mu.Unlock()
+}
+
 func percentile(sorted []time.Duration, p float64) time.Duration {
 	if len(sorted) == 0 {
 		return 0
@@ -291,12 +306,22 @@ type LoadBalancer struct {
 	backends  []*Backend
 	metrics   *Metrics
 	weights   Weights
-	threshold float64
+	threshold atomic.Uint64 // float64 bits, adjustable at runtime
 
 	// The backend currently carrying traffic. Requests stay here until its
 	// score crosses the threshold, which is what makes this a threshold-driven
 	// switch rather than a rotation.
 	current atomic.Pointer[Backend]
+}
+
+// Threshold is read on every request and written by the tuning endpoint, so it
+// lives as bits in an atomic rather than behind a lock on the hot path.
+func (lb *LoadBalancer) Threshold() float64 {
+	return math.Float64frombits(lb.threshold.Load())
+}
+
+func (lb *LoadBalancer) SetThreshold(v float64) {
+	lb.threshold.Store(math.Float64bits(v))
 }
 
 func (lb *LoadBalancer) score(b *Backend) float64 {
@@ -332,7 +357,7 @@ func (lb *LoadBalancer) candidates() []*Backend {
 	chosen := alive[0].backend
 	if current := lb.current.Load(); current != nil && current.Alive.Load() {
 		currentScore := lb.score(current)
-		if currentScore <= lb.threshold {
+		if currentScore <= lb.Threshold() {
 			// Still comfortable: keep sending here.
 			chosen = current
 		} else if chosen != current {
@@ -364,6 +389,33 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/lb/metrics":
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(lb.metrics.snapshot())
+		return
+	case "/lb/config":
+		// Lets the switching threshold be swept without a restart. Finding a
+		// good value means comparing full load runs against each other, and
+		// restarting between them would reset every warm connection and
+		// counter that the comparison depends on.
+		if value := r.URL.Query().Get("threshold"); value != "" {
+			parsed, err := strconv.ParseFloat(value, 64)
+			if err != nil || parsed < 0 {
+				http.Error(w, "threshold must be a non-negative number", http.StatusBadRequest)
+				return
+			}
+			lb.SetThreshold(parsed)
+			log.Printf("threshold set to %.3f", parsed)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"threshold": lb.Threshold()})
+		return
+	case "/lb/reset-metrics":
+		lb.metrics.reset()
+		for _, b := range lb.backends {
+			b.Requests.Store(0)
+			b.Failures.Store(0)
+			b.ewmaMicros.Store(0)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
 		return
 	case "/lb/stats":
 		// The balancer's own machine. The backends report themselves through
@@ -462,7 +514,7 @@ func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 	out := struct {
 		Threshold float64         `json:"threshold"`
 		Backends  []backendStatus `json:"backends"`
-	}{Threshold: lb.threshold}
+	}{Threshold: lb.Threshold()}
 
 	for _, b := range lb.backends {
 		out.Backends = append(out.Backends, backendStatus{
@@ -768,10 +820,10 @@ func main() {
 	}
 
 	lb := &LoadBalancer{
-		metrics:   &Metrics{maxSamples: 100_000},
-		weights:   Weights{InFlight: *wInFlight, Latency: *wLatency, CPU: *wCPU},
-		threshold: *threshold,
+		metrics: &Metrics{maxSamples: 100_000},
+		weights: Weights{InFlight: *wInFlight, Latency: *wLatency, CPU: *wCPU},
 	}
+	lb.SetThreshold(*threshold)
 
 	for _, part := range strings.Split(*backendsFlag, ",") {
 		part = strings.TrimSpace(part)
@@ -816,7 +868,7 @@ func main() {
 
 	log.Printf(
 		"load balancer on %s | backends=%d threshold=%.2f weights(inflight=%.2f latency=%.3f cpu=%.2f) gomaxprocs=%d",
-		*listenAddr, len(lb.backends), lb.threshold, lb.weights.InFlight, lb.weights.Latency, lb.weights.CPU,
+		*listenAddr, len(lb.backends), lb.Threshold(), lb.weights.InFlight, lb.weights.Latency, lb.weights.CPU,
 		applyCPUQuota(),
 	)
 
