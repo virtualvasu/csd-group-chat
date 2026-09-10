@@ -11,6 +11,7 @@ const { registerSocketHandlers, ROOM_ID } = require('./src/socketHandlers');
 const { createHealthRouter } = require('./src/routes/health');
 const { createLoadTestRouter } = require('./src/routes/loadtest');
 const { createApiRouter, createTracker } = require('./src/routes/api');
+const { createFastPath } = require('./src/routes/fastPath');
 const { MessageStore } = require('./src/feed/messageStore');
 const { Replicator } = require('./src/feed/replicator');
 const { Reconciler } = require('./src/feed/reconciler');
@@ -82,7 +83,15 @@ async function start() {
   console.log('Connected to MongoDB');
 
   const app = express();
-  const httpServer = createServer(app);
+
+  // The two hot routes are answered before Express sees the request; anything
+  // else falls through to it unchanged. See src/routes/fastPath.js for why.
+  let fastPath = () => false;
+  const httpServer = createServer((req, res) => {
+    if (fastPath(req, res)) return;
+    app(req, res);
+  });
+
   const io = new Server(httpServer);
 
   const presence = new Presence();
@@ -114,6 +123,10 @@ async function start() {
   // Order matters. The API routes are the hot path and are matched first;
   // putting express.static ahead of them would make every /message and /feed
   // request pay for a filesystem lookup that can only ever miss.
+  // Still registered on Express as well: the fast path handles the common
+  // shapes, and these remain the definition of the routes for anything it
+  // declines to take, so behaviour cannot drift between the two.
+  fastPath = createFastPath({ store, replicator, tracker });
   app.use(createApiRouter({ store, replicator, tracker, reconciler }));
   app.use(createHealthRouter(presence));
   app.use(createLoadTestRouter());

@@ -64,6 +64,17 @@ function createTracker() {
   };
 }
 
+// Pulls the message fields out of whatever a caller sent, wherever they sent
+// them. Shared with the fast path so both front ends accept exactly the same
+// inputs and there is one place to change if that ever needs to widen.
+function extractMessageFields(...sources) {
+  return {
+    id: normalizeId(pick(sources, ID_KEYS)),
+    name: cleanName(pick(sources, NAME_KEYS)),
+    text: cleanText(pick(sources, TEXT_KEYS)),
+  };
+}
+
 function createApiRouter({ store, replicator, tracker, reconciler = null }) {
   const router = Router();
 
@@ -73,13 +84,13 @@ function createApiRouter({ store, replicator, tracker, reconciler = null }) {
     tracker.total += 1;
 
     try {
-      const sources = [req.body, req.query];
-      const name = cleanName(pick(sources, NAME_KEYS));
-      const text = cleanText(pick(sources, TEXT_KEYS));
-      // A caller that supplies its own id gets exactly-once semantics for free:
-      // resending the same id after a timeout or a reconnect resolves to the
-      // message that is already stored.
-      const id = normalizeId(pick(sources, ID_KEYS)) || ulid();
+      // A caller that supplies its own id gets exactly-once semantics for
+      // free: resending the same id after a timeout or a reconnect resolves to
+      // the message that is already stored.
+      const fields = extractMessageFields(req.body, req.query);
+      const name = fields.name;
+      const text = fields.text;
+      const id = fields.id || ulid();
 
       const ts = Date.now();
       const result = await store.add({ id, name, text, ts });
@@ -205,4 +216,4 @@ function createApiRouter({ store, replicator, tracker, reconciler = null }) {
   return router;
 }
 
-module.exports = { createApiRouter, createTracker, cleanName, cleanText };
+module.exports = { createApiRouter, createTracker, cleanName, cleanText, extractMessageFields };
