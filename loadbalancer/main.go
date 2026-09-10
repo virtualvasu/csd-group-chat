@@ -31,6 +31,17 @@ type Backend struct {
 	Alive    atomic.Bool
 	InFlight atomic.Int64
 	proxy    *httputil.ReverseProxy
+
+	// consecutiveHealthFailures counts back-to-back failed active health
+	// checks. A backend under heavy but legitimate load can occasionally miss
+	// the health check's timeout without actually being down — Node runs the
+	// health handler on the same single-threaded event loop as every other
+	// request, so a burst of concurrent traffic can transiently delay it past
+	// the deadline. Requiring several failures in a row before flipping Alive
+	// to false (see healthLoop) avoids a single slow response taking a
+	// working backend out of rotation, which would only pile its load onto
+	// the remaining backends and risk cascading the same problem to them.
+	consecutiveHealthFailures atomic.Int64
 }
 
 // Metrics are the load balancer's own request counters, independent of
@@ -282,16 +293,33 @@ func (r *statusRecorder) Flush() {
 // flips Alive accordingly. A backend that starts failing proxied requests is
 // also marked dead immediately by the reverse proxy's ErrorHandler below;
 // this loop is what brings it back once it recovers.
-func (lb *LoadBalancer) healthLoop(interval, timeout time.Duration) {
+//
+// A backend is marked dead only after failThreshold consecutive failed
+// checks, but returns to alive on the very first success. One slow health
+// check under a real traffic spike (see the comment on
+// Backend.consecutiveHealthFailures) should not be enough to pull a working
+// backend out of rotation; several in a row, on the other hand, is a real
+// signal something is actually wrong.
+func (lb *LoadBalancer) healthLoop(interval, timeout time.Duration, failThreshold int64) {
 	client := &http.Client{Timeout: timeout}
 	for {
 		for _, b := range lb.backends {
 			healthURL := strings.TrimRight(b.URL.String(), "/") + "/health"
 			resp, err := client.Get(healthURL)
-			alive := err == nil && resp.StatusCode < 500
+			healthy := err == nil && resp.StatusCode < 500
 			if resp != nil {
 				resp.Body.Close()
 			}
+
+			var alive bool
+			if healthy {
+				b.consecutiveHealthFailures.Store(0)
+				alive = true
+			} else {
+				failures := b.consecutiveHealthFailures.Add(1)
+				alive = failures < failThreshold
+			}
+
 			was := b.Alive.Swap(alive)
 			if was != alive {
 				log.Printf("backend %s health changed: alive=%v", b.URL, alive)
@@ -305,8 +333,9 @@ func main() {
 	backendsFlag := flag.String("backends", "", "comma-separated list of backend base URLs, e.g. http://sys2:4000,http://sys3:4000,http://sys4:4000")
 	listenAddr := flag.String("listen", ":8080", "address the load balancer listens on")
 	healthInterval := flag.Duration("health-interval", 1*time.Second, "interval between backend health checks")
-	healthTimeout := flag.Duration("health-timeout", 800*time.Millisecond, "timeout for a single health check request")
-	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond, "timeout waiting for a backend's response headers")
+	healthTimeout := flag.Duration("health-timeout", 1500*time.Millisecond, "timeout for a single health check request")
+	healthFailThreshold := flag.Int64("health-fail-threshold", 3, "consecutive failed health checks required before a backend is marked dead; it returns to alive on the first success")
+	backendTimeout := flag.Duration("backend-timeout", 3*time.Second, "timeout waiting for a backend's response headers")
 	dialTimeout := flag.Duration("dial-timeout", 800*time.Millisecond, "timeout connecting to a backend")
 	maxInFlight := flag.Int64("max-inflight", 8, "in-flight requests on a backend at or above which it is treated as overloaded and only used if no less-loaded backend is available; 0 disables this")
 	tlsCert := flag.String("tls-cert", "", "path to a TLS certificate file; if set with -tls-key, serve HTTPS instead of plain HTTP")
@@ -358,7 +387,17 @@ func main() {
 			// outright. (It is only ever unsafe to retry after headers have
 			// already been committed to the client, which is not the case
 			// here — see the retry loop in LoadBalancer.ServeHTTP.)
-			b.Alive.Store(false)
+			//
+			// Shares consecutiveHealthFailures with healthLoop rather than
+			// flipping Alive on a single failure: under a real traffic spike
+			// a backend can miss one request's deadline while still being
+			// genuinely up, and marking it dead immediately would only dump
+			// its share of the load onto the remaining backends and risk the
+			// same failure cascading to them.
+			failures := b.consecutiveHealthFailures.Add(1)
+			if failures >= *healthFailThreshold {
+				b.Alive.Store(false)
+			}
 			lb.metrics.BackendErrors.Add(1)
 			log.Printf("backend %s error: %v", b.URL, err)
 			if rec, ok := rw.(*statusRecorder); ok {
@@ -374,7 +413,7 @@ func main() {
 		lb.backends = append(lb.backends, b)
 	}
 
-	go lb.healthLoop(*healthInterval, *healthTimeout)
+	go lb.healthLoop(*healthInterval, *healthTimeout, *healthFailThreshold)
 
 	// TLS terminates here, at the load balancer, and traffic to the
 	// backends stays plain HTTP — the browser only needs a secure context
