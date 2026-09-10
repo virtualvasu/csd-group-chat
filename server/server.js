@@ -31,7 +31,35 @@ const PORT = process.env.PORT || 4000;
 function resolveWorkerCount() {
   const configured = Number(process.env.WORKERS || 0);
   if (configured > 0) return configured;
-  return Math.max(1, Math.min(os.cpus().length, 4));
+
+  // os.cpus() reports the host's cores, not this container's share of them, so
+  // it is an upper bound rather than an answer — a container limited to a
+  // fraction of a large machine would otherwise fork dozens of workers that
+  // only fight each other. The cgroup quota is the real limit where it is set.
+  return Math.max(1, Math.min(availableCores(), 8));
+}
+
+function availableCores() {
+  const fs = require('node:fs');
+
+  // cgroup v2: "<quota> <period>", or "max" when unlimited.
+  try {
+    const [quota, period] = fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+    if (quota !== 'max') {
+      return Math.max(1, Math.floor(Number(quota) / Number(period)));
+    }
+  } catch {}
+
+  // cgroup v1.
+  try {
+    const quota = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8'));
+    const period = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8'));
+    if (quota > 0 && period > 0) {
+      return Math.max(1, Math.floor(quota / period));
+    }
+  } catch {}
+
+  return os.cpus().length;
 }
 
 const WORKERS = resolveWorkerCount();
