@@ -183,7 +183,12 @@ func applyCPUQuota() int {
 	// syscall does not leave the quota unused, without inviting the thrashing
 	// that a much larger number would.
 	procs := int(quota/period) + 1
-	return runtime.GOMAXPROCS(procs)
+
+	// GOMAXPROCS returns the *previous* setting, so returning its result would
+	// report the host's core count and make it look as though the quota had
+	// been ignored.
+	runtime.GOMAXPROCS(procs)
+	return procs
 }
 
 func (lb *LoadBalancer) totalInFlight() int64 {
