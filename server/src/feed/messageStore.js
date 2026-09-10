@@ -101,6 +101,45 @@ class MessageStore extends EventEmitter {
     return this.messages.length;
   }
 
+  has(id) {
+    return this.ids.has(id);
+  }
+
+  // A cheap summary for peers to compare against without transferring
+  // anything: if the count and the newest id both match, the two machines hold
+  // the same conversation and no repair is needed.
+  digest() {
+    const last = this.messages[this.messages.length - 1];
+    return {
+      count: this.messages.length,
+      lastId: last ? last.id : null,
+    };
+  }
+
+  idList() {
+    return this.messages.map((message) => message.id);
+  }
+
+  // Returns the stored, still-encrypted form of specific messages, for a peer
+  // repairing a gap. Read from the database rather than from memory because
+  // memory holds decrypted text — sending that would put plaintext on the wire
+  // where the push path sends ciphertext.
+  async fetchEncrypted(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+
+    const documents = await this.collection()
+      .find({ _id: { $in: ids } })
+      .toArray();
+
+    return documents.map((doc) => ({
+      id: typeof doc._id === 'string' ? doc._id : String(doc._id),
+      name: doc.senderId,
+      ts: doc.clientTimestamp ?? (doc.timestamp ? doc.timestamp.getTime() : Date.now()),
+      ciphertext: toBuffer(doc.ciphertext).toString('base64'),
+      nonce: toBuffer(doc.nonce).toString('base64'),
+    }));
+  }
+
   stats() {
     return {
       messages: this.messages.length,

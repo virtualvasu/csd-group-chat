@@ -13,6 +13,7 @@ const { createLoadTestRouter } = require('./src/routes/loadtest');
 const { createApiRouter, createTracker } = require('./src/routes/api');
 const { MessageStore } = require('./src/feed/messageStore');
 const { Replicator } = require('./src/feed/replicator');
+const { Reconciler } = require('./src/feed/reconciler');
 const { startSampling } = require('./src/systemStats');
 const { loadKey } = require('./src/crypto/messageCipher');
 const db = require('./src/db');
@@ -93,6 +94,14 @@ async function start() {
   store.start();
 
   const replicator = new Replicator(PEERS);
+
+  // Only one worker per machine reconciles. Every worker shares the same local
+  // database, so a second one would re-pull the same messages and repair
+  // nothing that the first had not already fixed.
+  const reconciler =
+    !cluster.isWorker || cluster.worker.id === 1 ? new Reconciler(store, PEERS) : null;
+  if (reconciler) reconciler.start();
+
   startSampling();
 
   // Bodies arrive as JSON from most clients and as a form post from some, and
@@ -103,7 +112,7 @@ async function start() {
   // Order matters. The API routes are the hot path and are matched first;
   // putting express.static ahead of them would make every /message and /feed
   // request pay for a filesystem lookup that can only ever miss.
-  app.use(createApiRouter({ store, replicator, tracker }));
+  app.use(createApiRouter({ store, replicator, tracker, reconciler }));
   app.use(createHealthRouter(presence));
   app.use(createLoadTestRouter());
   app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
@@ -125,7 +134,7 @@ async function start() {
     );
   });
 
-  return { httpServer, io, store, replicator };
+  return { httpServer, io, store, replicator, reconciler };
 }
 
 // Messages reach a worker three ways: posted to its own /message route, pushed
@@ -198,6 +207,7 @@ async function shutdown(signal, context) {
       // stored, so flush before the connection goes away.
       await context.store.flushWrites();
       context.replicator.stop();
+      if (context.reconciler) context.reconciler.stop();
     }
 
     await db.close();

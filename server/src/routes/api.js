@@ -64,7 +64,7 @@ function createTracker() {
   };
 }
 
-function createApiRouter({ store, replicator, tracker }) {
+function createApiRouter({ store, replicator, tracker, reconciler = null }) {
   const router = Router();
 
   router.post('/message', async (req, res) => {
@@ -139,6 +139,7 @@ function createApiRouter({ store, replicator, tracker }) {
         ewmaMs: Number(tracker.ewmaMs.toFixed(2)),
         store: store.stats(),
         replication: replicator.stats(),
+        reconciliation: reconciler ? reconciler.stats() : null,
       })
     );
   });
@@ -152,6 +153,28 @@ function createApiRouter({ store, replicator, tracker }) {
       res.json({ status: 'ok', stored });
     } catch (err) {
       console.error('replication ingest failed:', err.message);
+      res.status(500).json({ status: 'error' });
+    }
+  });
+
+  // --- anti-entropy, used by peers to repair gaps in their own copy ---
+
+  // Cheap comparison point: matching count and newest id means no repair.
+  router.get('/internal/digest', (req, res) => {
+    res.json(store.digest());
+  });
+
+  router.get('/internal/ids', (req, res) => {
+    res.json({ ids: store.idList() });
+  });
+
+  // The still-encrypted rows for a specific set of ids.
+  router.post('/internal/fetch', async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
+      res.json({ messages: await store.fetchEncrypted(ids) });
+    } catch (err) {
+      console.error('internal fetch failed:', err.message);
       res.status(500).json({ status: 'error' });
     }
   });
