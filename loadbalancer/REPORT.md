@@ -125,14 +125,76 @@ CPU spikes clearly track the load test windows (idle baseline ~1-2%, up to
 ~15-19% during the concurrency-50 run); all 4 curves move together because
 these VMs share one physical host.
 
-## Relevant Screenshots
-- [ ] `curl` output of `/lb/status` showing all three backends alive, with `in_flight`/`overloaded` fields
-- [ ] `loadgen` terminal output for the single-backend run
-- [ ] `loadgen` terminal output for the three-backend run
-- [ ] `loadgen` terminal output showing the dynamic-selection effect (e.g. one backend saturated, `/lb/status` showing it marked `overloaded` while traffic shifts to the others)
-- [ ] Browser screenshot of the chat app working through the load balancer
-      (i.e. loaded from `http://10.1.75.53:3265/`)
-- [ ] `curl -X POST .../message -d '{"client-name":"x","msg":"y","id":"dup-1"}'` sent twice, showing `duplicate: false` then `duplicate: true`, and `GET /feed` showing only one copy stored
+## Evidence
+
+### Load balancer status — all backends alive, dynamic-selection fields present
+
+```
+$ curl -sk https://10.1.75.53:4285/lb/status
+{
+    "overload_threshold": 8,
+    "backends": [
+        {"url": "http://10.1.75.53:4286", "alive": true, "in_flight": 0, "overloaded": false},
+        {"url": "http://10.1.75.53:4287", "alive": true, "in_flight": 0, "overloaded": false},
+        {"url": "http://10.1.75.53:4288", "alive": true, "in_flight": 0, "overloaded": false}
+    ]
+}
+```
+
+### Chat app working through the load balancer (browser, HTTPS)
+
+The login screen generating a WebCrypto signing key — only possible because
+the page is served over a genuine secure context (HTTPS terminated at the
+load balancer):
+
+![Login screen through the load balancer](screenshots/login.png)
+
+After signing in: 100 messages restored from persistent storage (a mix of
+messages submitted earlier via `loadgen`'s `POST /message` calls and this
+live browser session), plus one freshly sent, signed message going out
+through the load balancer:
+
+![Chat through the load balancer](screenshots/chat-through-lb.png)
+
+### `/message` idempotency — retried id is deduplicated
+
+```
+$ curl -sk -X POST https://10.1.75.53:4285/message -H "Content-Type: application/json" \
+    -d '{"client-name":"report-demo","msg":"duplicate-id demo message","id":"report-demo-dup-1"}'
+{"id":"6aa2b5f957ac46acecbd1b65","duplicate":false}
+
+$ curl -sk -X POST https://10.1.75.53:4285/message -H "Content-Type: application/json" \
+    -d '{"client-name":"report-demo","msg":"duplicate-id demo message","id":"report-demo-dup-1"}'
+{"id":"6aa2b5f957ac46acecbd1b65","duplicate":true}
+```
+
+`GET /feed` confirms the retried id was stored exactly once, not twice:
+
+```
+$ curl -sk https://10.1.75.53:4285/feed | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(sum(1 for m in data['messages'] if m['id'] == '6aa2b5f957ac46acecbd1b65'))
+"
+1
+```
+
+### `loadgen` terminal output (medium-load-c25 run)
+
+```
+$ ./loadgen -url https://10.1.75.53:4285 -requests 750 -concurrency 25 -users 25 \
+    -feed-ratio 0.15 -min-msg-len 10 -max-msg-len 150 \
+    -min-interval-ms 100 -max-interval-ms 500 -insecure \
+    -experiment medium-load-c25 -out results/medium-load-c25.json -csv results/comparison.csv
+
+experiment=medium-load-c25 requests=750 concurrency=25 users=25 feed_ratio=0.15
+  successful=601 failed=149 dropout=19.87%
+  throughput=23.4 rps  (elapsed 25.65s)
+  overall  p50=51.5ms p95=2397.2ms p99=5001.2ms
+  /message n=626 p50=47.5ms p95=925.8ms
+  /feed    n=124 p50=1995.8ms p95=5001.3ms
+  first error: Get "https://10.1.75.53:4285/feed": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+```
 
 ## Integration with the Previous (Group) Assignment
 - Previously graded messaging app URL: (fill in)
