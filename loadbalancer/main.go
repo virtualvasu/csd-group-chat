@@ -87,18 +87,25 @@ type Metrics struct {
 	Switches      atomic.Uint64
 	Retries       atomic.Uint64
 
-	mu         sync.Mutex
-	latencies  []time.Duration
-	maxSamples int
+	// Latency samples in a fixed ring, written at an atomic index.
+	ring []atomic.Int64
+	pos  atomic.Uint64
 }
 
+func newMetrics(size int) *Metrics {
+	return &Metrics{ring: make([]atomic.Int64, size)}
+}
+
+// record stores one latency sample without taking a lock.
+//
+// This runs on every proxied request. The previous version took a mutex and
+// appended to a slice, which put every concurrent request through one lock —
+// and the reslice-from-the-front it used to bound the window meant the
+// underlying array was periodically reallocated and 100,000 samples copied.
+// A fixed ring written at an atomic index costs one store and never allocates.
 func (m *Metrics) record(d time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.latencies) >= m.maxSamples {
-		m.latencies = m.latencies[1:]
-	}
-	m.latencies = append(m.latencies, d)
+	index := m.pos.Add(1) - 1
+	m.ring[index%uint64(len(m.ring))].Store(d.Microseconds())
 }
 
 // Clears the counters between tuning runs so each threshold is measured on its
@@ -111,26 +118,27 @@ func (m *Metrics) reset() {
 	m.Switches.Store(0)
 	m.Retries.Store(0)
 
-	m.mu.Lock()
-	m.latencies = m.latencies[:0]
-	m.mu.Unlock()
+	for i := range m.ring {
+		m.ring[i].Store(0)
+	}
+	m.pos.Store(0)
 }
 
-func percentile(sorted []time.Duration, p float64) time.Duration {
+func percentile(sorted []int64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
 	}
-	idx := int(p * float64(len(sorted)-1))
-	return sorted[idx]
+	return float64(sorted[int(p*float64(len(sorted)-1))]) / 1000.0
 }
 
 func (m *Metrics) snapshot() map[string]any {
-	m.mu.Lock()
-	latencies := append([]time.Duration(nil), m.latencies...)
-	m.mu.Unlock()
-
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	toMs := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+	samples := make([]int64, 0, len(m.ring))
+	for i := range m.ring {
+		if value := m.ring[i].Load(); value > 0 {
+			samples = append(samples, value)
+		}
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 
 	return map[string]any{
 		"total":          m.Total.Load(),
@@ -139,9 +147,10 @@ func (m *Metrics) snapshot() map[string]any {
 		"backend_errors": m.BackendErrors.Load(),
 		"switches":       m.Switches.Load(),
 		"retries":        m.Retries.Load(),
-		"p50_ms":         toMs(percentile(latencies, 0.50)),
-		"p95_ms":         toMs(percentile(latencies, 0.95)),
-		"p99_ms":         toMs(percentile(latencies, 0.99)),
+		"p50_ms":         percentile(samples, 0.50),
+		"p95_ms":         percentile(samples, 0.95),
+		"p99_ms":         percentile(samples, 0.99),
+		"samples":        len(samples),
 	}
 }
 
@@ -336,45 +345,62 @@ func (lb *LoadBalancer) score(b *Backend) float64 {
 // fallbacks used if it fails. The current backend keeps the head while its
 // score is under the threshold. Once it crosses, the least loaded healthy
 // backend takes over and becomes current.
-func (lb *LoadBalancer) candidates() []*Backend {
-	type scored struct {
-		backend *Backend
-		score   float64
+const maxTrackedBackends = 16
+
+// candidates fills dst with the healthy backends, best first, and returns the
+// filled prefix. The caller supplies the array so that choosing a backend —
+// which happens on every single request — allocates nothing.
+//
+// The ordering is an insertion sort rather than sort.Slice: with a handful of
+// backends the reflection and closure that sort.Slice needs cost more than the
+// comparisons themselves.
+func (lb *LoadBalancer) candidates(dst *[maxTrackedBackends]*Backend) []*Backend {
+	var scores [maxTrackedBackends]float64
+	count := 0
+
+	for _, b := range lb.backends {
+		if count == maxTrackedBackends {
+			break
+		}
+		if !b.Alive.Load() {
+			continue
+		}
+
+		score := lb.score(b)
+		i := count
+		for i > 0 && scores[i-1] > score {
+			scores[i] = scores[i-1]
+			dst[i] = dst[i-1]
+			i--
+		}
+		scores[i] = score
+		dst[i] = b
+		count++
 	}
 
-	alive := make([]scored, 0, len(lb.backends))
-	for _, b := range lb.backends {
-		if b.Alive.Load() {
-			alive = append(alive, scored{b, lb.score(b)})
-		}
-	}
-	if len(alive) == 0 {
+	if count == 0 {
 		return nil
 	}
 
-	sort.Slice(alive, func(i, j int) bool { return alive[i].score < alive[j].score })
-
-	chosen := alive[0].backend
+	// The threshold rule: stay on the backend currently carrying traffic while
+	// its score is under the threshold, and move to the least loaded one once
+	// it crosses.
 	if current := lb.current.Load(); current != nil && current.Alive.Load() {
-		currentScore := lb.score(current)
-		if currentScore <= lb.Threshold() {
-			// Still comfortable: keep sending here.
-			chosen = current
-		} else if chosen != current {
+		if lb.score(current) <= lb.Threshold() {
+			for i := 0; i < count; i++ {
+				if dst[i] == current {
+					copy(dst[1:i+1], dst[0:i])
+					dst[0] = current
+					break
+				}
+			}
+		} else if dst[0] != current {
 			lb.metrics.Switches.Add(1)
 		}
 	}
-	lb.current.Store(chosen)
 
-	ordered := make([]*Backend, 0, len(alive))
-	ordered = append(ordered, chosen)
-	for _, entry := range alive {
-		if entry.backend != chosen {
-			ordered = append(ordered, entry.backend)
-		}
-	}
-
-	return ordered
+	lb.current.Store(dst[0])
+	return dst[:count]
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -436,7 +462,8 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	lb.metrics.Total.Add(1)
 
-	candidates := lb.candidates()
+	var candidateBuf [maxTrackedBackends]*Backend
+	candidates := lb.candidates(&candidateBuf)
 	if len(candidates) == 0 {
 		lb.metrics.Failed.Add(1)
 		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
@@ -820,7 +847,7 @@ func main() {
 	}
 
 	lb := &LoadBalancer{
-		metrics: &Metrics{maxSamples: 100_000},
+		metrics: newMetrics(65536),
 		weights: Weights{InFlight: *wInFlight, Latency: *wLatency, CPU: *wCPU},
 	}
 	lb.SetThreshold(*threshold)
