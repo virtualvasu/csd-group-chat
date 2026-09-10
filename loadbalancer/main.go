@@ -605,7 +605,7 @@ type chanListener struct {
 
 func newChanListener(addr net.Addr) *chanListener {
 	return &chanListener{
-		conns:  make(chan net.Conn, 64),
+		conns:  make(chan net.Conn, 1024),
 		addr:   addr,
 		closed: make(chan struct{}),
 	}
@@ -667,11 +667,38 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 		}
 	}()
 
+	// Accept errors must never end the loop. Running out of descriptors, or
+	// hitting a per-process connection limit, produces an error here that
+	// clears on its own moments later — but returning it stops the balancer
+	// accepting anything, for good. That is precisely what happened on the
+	// first evaluation run: the service went from healthy to unreachable
+	// mid-ladder and never came back, turning a load problem into an outage.
+	//
+	// So back off briefly and carry on, the way net/http's own Serve does.
+	// Only a closed listener is terminal.
+	var backoff time.Duration
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return err
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+			}
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+
+			log.Printf("accept failed (%v); retrying in %v", err, backoff)
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 
 		go func(conn net.Conn) {
 			reader := bufio.NewReader(conn)
@@ -715,6 +742,9 @@ func main() {
 	if *backendsFlag == "" {
 		log.Fatal("at least one -backends URL is required")
 	}
+
+	// Before anything opens a socket.
+	raiseFileLimit()
 
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
