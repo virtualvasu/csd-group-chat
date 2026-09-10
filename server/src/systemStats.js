@@ -73,12 +73,25 @@ let previousHost = previousUsage === null ? hostSnapshot() : null;
 let previousAt = Date.now();
 let cachedPercent = 0;
 
+// Node's own share of the container's CPU. The container figure includes
+// everything running in it — most importantly mongod, which sits on the same
+// single core — so comparing the two says whether time is going to the
+// application or to the database underneath it.
+let previousProcess = process.cpuUsage();
+let cachedProcessPercent = 0;
+
 // Recomputed on a timer so a burst of /stats requests all read the same recent
 // value rather than each taking its own near-zero-length sample.
 function sample() {
   const now = Date.now();
   const elapsedMicros = (now - previousAt) * 1000;
   if (elapsedMicros <= 0) return cachedPercent;
+
+  const processUsage = process.cpuUsage();
+  const processMicros =
+    processUsage.user - previousProcess.user + (processUsage.system - previousProcess.system);
+  previousProcess = processUsage;
+  cachedProcessPercent = clamp((100 * processMicros) / (elapsedMicros * CORES));
 
   const usage = readCgroupUsageMicros();
 
@@ -114,6 +127,9 @@ function getStats(extra = {}) {
     pid: process.pid,
     // Percent of *this container's* CPU entitlement, not of the host.
     cpuPercent: Number(cachedPercent.toFixed(2)),
+    // Node's own share; the gap between this and cpuPercent is mongod and
+    // anything else sharing the container.
+    processCpuPercent: Number(cachedProcessPercent.toFixed(2)),
     cpuCores: Number(CORES.toFixed(2)),
     hostCpuCount: os.cpus().length,
     loadAvg1: Number(os.loadavg()[0].toFixed(2)),

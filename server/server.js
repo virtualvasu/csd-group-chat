@@ -89,7 +89,9 @@ async function start() {
   const messageRateLimiter = new RateLimiter();
   const tracker = createTracker();
 
-  const store = new MessageStore({ roomId: ROOM_ID });
+  // The database rescan is only worth its cost when more than one worker
+  // process shares this machine's database.
+  const store = new MessageStore({ roomId: ROOM_ID, pollEnabled: WORKERS > 1 });
   await store.init(db.getDb());
   store.start();
 

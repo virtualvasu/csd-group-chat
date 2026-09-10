@@ -30,7 +30,7 @@ const DEFAULTS = {
   // through many runs does not eventually try to serialise a 100MB response.
   maxMessages: Number(process.env.FEED_MAX_MESSAGES || 30000),
   // How long a write may wait to be batched with its neighbours.
-  flushMs: Number(process.env.WRITE_FLUSH_MS || 5),
+  flushMs: Number(process.env.WRITE_FLUSH_MS || 0),
   flushMax: Number(process.env.WRITE_FLUSH_MAX || 250),
   // How often the cached /feed response is rebuilt. This is the staleness
   // bound for readers, and the main CPU knob: rebuilding is the only
@@ -42,6 +42,8 @@ const DEFAULTS = {
   // How far back each poll looks. Covers clock skew and slow writes without
   // rescanning the collection.
   pollLookbackMs: Number(process.env.FEED_POLL_LOOKBACK_MS || 3000),
+  // Only needed when sibling worker processes share this database.
+  pollEnabled: false,
 };
 
 class MessageStore extends EventEmitter {
@@ -66,6 +68,7 @@ class MessageStore extends EventEmitter {
 
     this.pendingWrites = [];
     this.flushTimer = null;
+    this.flushScheduled = false;
     this.flushing = false;
 
     this.lastPollAt = 0;
@@ -334,9 +337,23 @@ class MessageStore extends EventEmitter {
         return;
       }
 
-      if (!this.flushTimer) {
-        this.flushTimer = setTimeout(() => this.flushWrites(), this.options.flushMs);
-      }
+      if (this.flushScheduled) return;
+      this.flushScheduled = true;
+
+      // Batch on the event loop turn rather than on a fixed delay. A timer
+      // charges every request that fixed delay even when nothing else is
+      // happening — 5ms on a request whose useful work is under 1ms. Deferring
+      // to the end of the current turn instead costs nothing when idle, and
+      // still batches heavily under load: while one bulk write is in flight
+      // every request that arrives joins the next batch.
+      const schedule = this.options.flushMs > 0
+        ? (run) => setTimeout(run, this.options.flushMs)
+        : setImmediate;
+
+      schedule(() => {
+        this.flushScheduled = false;
+        this.flushWrites();
+      });
     });
   }
 
@@ -453,12 +470,25 @@ class MessageStore extends EventEmitter {
   }
 
   start() {
-    const rebuild = setInterval(() => this.rebuild(), this.options.rebuildMs);
-    const poll = setInterval(() => {
-      this.poll().catch((err) => console.error('feed poll failed:', err.message));
-    }, this.options.pollMs);
+    const timers = [setInterval(() => this.rebuild(), this.options.rebuildMs)];
 
-    for (const timer of [rebuild, poll]) {
+    // The rescan only exists to notice rows written by a *sibling worker
+    // process* sharing this machine's database. Messages this process accepted,
+    // and messages pushed here by a peer, are already in memory by the time
+    // they are written, and gaps left by a peer that was unreachable are the
+    // reconciler's job. With a single worker the scan therefore finds nothing
+    // it does not already have — while still making the database re-read and
+    // re-decode every recently written row several times a second, on the one
+    // core it shares with mongod.
+    if (this.options.pollEnabled) {
+      timers.push(
+        setInterval(() => {
+          this.poll().catch((err) => console.error('feed poll failed:', err.message));
+        }, this.options.pollMs)
+      );
+    }
+
+    for (const timer of timers) {
       if (typeof timer.unref === 'function') timer.unref();
       this.timers.push(timer);
     }
