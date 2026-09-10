@@ -129,17 +129,7 @@ these VMs share one physical host.
 
 ### Load balancer status — all backends alive, dynamic-selection fields present
 
-```
-$ curl -sk https://10.1.75.53:4285/lb/status
-{
-    "overload_threshold": 8,
-    "backends": [
-        {"url": "http://10.1.75.53:4286", "alive": true, "in_flight": 0, "overloaded": false},
-        {"url": "http://10.1.75.53:4287", "alive": true, "in_flight": 0, "overloaded": false},
-        {"url": "http://10.1.75.53:4288", "alive": true, "in_flight": 0, "overloaded": false}
-    ]
-}
-```
+![/lb/status output](screenshots/lb-status.png)
 
 ### Chat app working through the load balancer (browser, HTTPS)
 
@@ -158,43 +148,14 @@ through the load balancer:
 
 ### `/message` idempotency — retried id is deduplicated
 
-```
-$ curl -sk -X POST https://10.1.75.53:4285/message -H "Content-Type: application/json" \
-    -d '{"client-name":"report-demo","msg":"duplicate-id demo message","id":"report-demo-dup-1"}'
-{"id":"6aa2b5f957ac46acecbd1b65","duplicate":false}
+Same id POSTed twice returns `duplicate:false` then `duplicate:true`, and
+`GET /feed` confirms it was stored exactly once, not twice:
 
-$ curl -sk -X POST https://10.1.75.53:4285/message -H "Content-Type: application/json" \
-    -d '{"client-name":"report-demo","msg":"duplicate-id demo message","id":"report-demo-dup-1"}'
-{"id":"6aa2b5f957ac46acecbd1b65","duplicate":true}
-```
-
-`GET /feed` confirms the retried id was stored exactly once, not twice:
-
-```
-$ curl -sk https://10.1.75.53:4285/feed | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-print(sum(1 for m in data['messages'] if m['id'] == '6aa2b5f957ac46acecbd1b65'))
-"
-1
-```
+![Duplicate-message idempotency demo](screenshots/dedup-demo.png)
 
 ### `loadgen` terminal output (medium-load-c25 run)
 
-```
-$ ./loadgen -url https://10.1.75.53:4285 -requests 750 -concurrency 25 -users 25 \
-    -feed-ratio 0.15 -min-msg-len 10 -max-msg-len 150 \
-    -min-interval-ms 100 -max-interval-ms 500 -insecure \
-    -experiment medium-load-c25 -out results/medium-load-c25.json -csv results/comparison.csv
-
-experiment=medium-load-c25 requests=750 concurrency=25 users=25 feed_ratio=0.15
-  successful=601 failed=149 dropout=19.87%
-  throughput=23.4 rps  (elapsed 25.65s)
-  overall  p50=51.5ms p95=2397.2ms p99=5001.2ms
-  /message n=626 p50=47.5ms p95=925.8ms
-  /feed    n=124 p50=1995.8ms p95=5001.3ms
-  first error: Get "https://10.1.75.53:4285/feed": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
-```
+![loadgen terminal output](screenshots/loadgen-run.png)
 
 ## Integration with the Previous (Group) Assignment
 - Previously graded messaging app URL: (fill in)
