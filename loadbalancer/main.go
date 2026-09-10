@@ -1,9 +1,12 @@
-// Command loadbalancer is a round-robin, health-aware reverse proxy in front
-// of one or more copies of the csd-group-chat messaging backend.
+// Command loadbalancer is a performance-aware reverse proxy in front of the
+// csd-group-chat messaging backends.
 //
-// It is deployed on Sys1 and forwards to backend copies of server.js running
-// on Sys2, Sys3 and Sys4 (each pointed at the same MongoDB cluster and the
-// same CHAT_ENCRYPTION_KEY, so they all read/write the same chat history).
+// It is deployed on Sys1 and forwards to copies of the messaging server running
+// on Sys2, Sys3 and Sys4. Backend selection is driven by measured load rather
+// than by a fixed rotation: each backend carries a score built from how many
+// requests it is currently serving, how quickly it has been answering, and how
+// busy its CPU is. Traffic stays on a backend until that score crosses a
+// threshold, at which point it moves to the least loaded one.
 package main
 
 import (
@@ -12,13 +15,18 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,19 +35,57 @@ import (
 
 // Backend is one messaging-app instance the load balancer can forward to.
 type Backend struct {
-	URL      *url.URL
-	Alive    atomic.Bool
-	InFlight atomic.Int64
-	proxy    *httputil.ReverseProxy
+	URL   *url.URL
+	Alive atomic.Bool
+
+	// Updated by the balancer itself, on every request, so selection reacts
+	// immediately rather than waiting for the next stats poll.
+	InFlight   atomic.Int64
+	ewmaMicros atomic.Int64
+	Requests   atomic.Uint64
+	Failures   atomic.Uint64
+
+	// Reported by the backend and refreshed by the stats poller. CPU is held
+	// as hundredths of a percent so it can live in an atomic integer.
+	cpuCentis  atomic.Int64
+	backendEwma atomic.Int64
+	StoredMsgs atomic.Int64
+
+	proxy *httputil.ReverseProxy
 }
 
-// Metrics are the load balancer's own request counters, independent of
-// whatever a load generator records client-side. Exposed at /lb/metrics.
+// observe folds one request's duration into the backend's smoothed latency.
+// A plain average would take thousands of requests to notice a backend going
+// slow; this weights recent requests heavily enough to react within a burst.
+func (b *Backend) observe(d time.Duration) {
+	const alpha = 0.2
+	previous := b.ewmaMicros.Load()
+	current := d.Microseconds()
+
+	if previous == 0 {
+		b.ewmaMicros.Store(current)
+		return
+	}
+
+	b.ewmaMicros.Store(int64(float64(previous)*(1-alpha) + float64(current)*alpha))
+}
+
+func (b *Backend) LatencyMs() float64 {
+	return float64(b.ewmaMicros.Load()) / 1000.0
+}
+
+func (b *Backend) CPUPercent() float64 {
+	return float64(b.cpuCentis.Load()) / 100.0
+}
+
+// Metrics are the load balancer's own counters, exposed at /lb/metrics.
 type Metrics struct {
 	Total         atomic.Uint64
 	Success       atomic.Uint64
 	Failed        atomic.Uint64
 	BackendErrors atomic.Uint64
+	Switches      atomic.Uint64
+	Retries       atomic.Uint64
 
 	mu         sync.Mutex
 	latencies  []time.Duration
@@ -50,8 +96,6 @@ func (m *Metrics) record(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.latencies) >= m.maxSamples {
-		// Drop the oldest sample so long-running processes do not grow this
-		// slice without bound.
 		m.latencies = m.latencies[1:]
 	}
 	m.latencies = append(m.latencies, d)
@@ -71,7 +115,6 @@ func (m *Metrics) snapshot() map[string]any {
 	m.mu.Unlock()
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-
 	toMs := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 
 	return map[string]any{
@@ -79,38 +122,147 @@ func (m *Metrics) snapshot() map[string]any {
 		"success":        m.Success.Load(),
 		"failed":         m.Failed.Load(),
 		"backend_errors": m.BackendErrors.Load(),
+		"switches":       m.Switches.Load(),
+		"retries":        m.Retries.Load(),
 		"p50_ms":         toMs(percentile(latencies, 0.50)),
 		"p95_ms":         toMs(percentile(latencies, 0.95)),
 		"p99_ms":         toMs(percentile(latencies, 0.99)),
 	}
 }
 
-// LoadBalancer holds the backend list and the shared round-robin cursor.
-type LoadBalancer struct {
-	backends []*Backend
-	next     atomic.Uint64
-	metrics  *Metrics
+func (lb *LoadBalancer) totalInFlight() int64 {
+	var total int64
+	for _, b := range lb.backends {
+		total += b.InFlight.Load()
+	}
+	return total
 }
 
-// candidateBackends returns every currently-healthy backend, starting from
-// the shared round-robin cursor and wrapping around once. Callers try them
-// in this order, falling through to the next one if a request fails, so a
-// single backend erroring out under load does not fail the request outright
-// as long as another healthy backend exists.
-func (lb *LoadBalancer) candidateBackends() []*Backend {
-	n := len(lb.backends)
-	if n == 0 {
-		return nil
+// cpuPercent reports how busy this machine has been since the last call.
+//
+// /proc/stat counts jiffies per state since boot, so a single reading says
+// nothing on its own — the busy fraction is the change between two readings.
+// Returns 0 where /proc is not available, which keeps this harmless when the
+// balancer is run on a development machine rather than on the lab system.
+var cpuState struct {
+	mu           sync.Mutex
+	lastIdle     uint64
+	lastTotal    uint64
+	lastReported float64
+}
+
+func cpuPercent() float64 {
+	cpuState.mu.Lock()
+	defer cpuState.mu.Unlock()
+
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0
 	}
-	start := int(lb.next.Add(1) % uint64(n))
-	candidates := make([]*Backend, 0, n)
-	for i := 0; i < n; i++ {
-		b := lb.backends[(start+i)%n]
-		if b.Alive.Load() {
-			candidates = append(candidates, b)
+
+	line, _, _ := strings.Cut(string(data), "\n")
+	if !strings.HasPrefix(line, "cpu ") {
+		return 0
+	}
+
+	var idle, total uint64
+	for i, field := range strings.Fields(line)[1:] {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil {
+			continue
+		}
+		total += value
+		// Fields 3 and 4 are idle and iowait.
+		if i == 3 || i == 4 {
+			idle += value
 		}
 	}
-	return candidates
+
+	idleDelta := idle - cpuState.lastIdle
+	totalDelta := total - cpuState.lastTotal
+	cpuState.lastIdle = idle
+	cpuState.lastTotal = total
+
+	if totalDelta > 0 {
+		cpuState.lastReported = 100 * (1 - float64(idleDelta)/float64(totalDelta))
+	}
+
+	return cpuState.lastReported
+}
+
+// Weights turn three different measurements into one comparable number.
+// Defaults are chosen so that one unit of score means roughly the same amount
+// of "busy" whichever measurement it came from: one outstanding request, 20ms
+// of smoothed latency, or 10% of a CPU.
+type Weights struct {
+	InFlight float64
+	Latency  float64
+	CPU      float64
+}
+
+type LoadBalancer struct {
+	backends  []*Backend
+	metrics   *Metrics
+	weights   Weights
+	threshold float64
+
+	// The backend currently carrying traffic. Requests stay here until its
+	// score crosses the threshold, which is what makes this a threshold-driven
+	// switch rather than a rotation.
+	current atomic.Pointer[Backend]
+}
+
+func (lb *LoadBalancer) score(b *Backend) float64 {
+	return lb.weights.InFlight*float64(b.InFlight.Load()) +
+		lb.weights.Latency*b.LatencyMs() +
+		lb.weights.CPU*b.CPUPercent()
+}
+
+// candidates returns the backends to try, best first.
+//
+// The head of the list is the backend traffic should go to; the rest are the
+// fallbacks used if it fails. The current backend keeps the head while its
+// score is under the threshold. Once it crosses, the least loaded healthy
+// backend takes over and becomes current.
+func (lb *LoadBalancer) candidates() []*Backend {
+	type scored struct {
+		backend *Backend
+		score   float64
+	}
+
+	alive := make([]scored, 0, len(lb.backends))
+	for _, b := range lb.backends {
+		if b.Alive.Load() {
+			alive = append(alive, scored{b, lb.score(b)})
+		}
+	}
+	if len(alive) == 0 {
+		return nil
+	}
+
+	sort.Slice(alive, func(i, j int) bool { return alive[i].score < alive[j].score })
+
+	chosen := alive[0].backend
+	if current := lb.current.Load(); current != nil && current.Alive.Load() {
+		currentScore := lb.score(current)
+		if currentScore <= lb.threshold {
+			// Still comfortable: keep sending here.
+			chosen = current
+		} else if chosen != current {
+			lb.metrics.Switches.Add(1)
+		}
+	}
+	lb.current.Store(chosen)
+
+	ordered := make([]*Backend, 0, len(alive))
+	ordered = append(ordered, chosen)
+	for _, entry := range alive {
+		if entry.backend != chosen {
+			ordered = append(ordered, entry.backend)
+		}
+	}
+
+	return ordered
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -126,21 +278,31 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(lb.metrics.snapshot())
 		return
+	case "/lb/stats":
+		// The balancer's own machine. The backends report themselves through
+		// their /stats route; without this one, Sys1 would be the one system
+		// in the deployment with no utilisation figures.
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"cpuPercent": math.Round(cpuPercent()*100) / 100,
+			"goroutines": runtime.NumGoroutine(),
+			"cpuCount":   runtime.NumCPU(),
+			"inFlight":   lb.totalInFlight(),
+		})
+		return
 	}
 
 	lb.metrics.Total.Add(1)
 
-	candidates := lb.candidateBackends()
+	candidates := lb.candidates()
 	if len(candidates) == 0 {
 		lb.metrics.Failed.Add(1)
 		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Buffer the request body once (it is a stream and can only be read a
-	// single time) so it can be replayed if the first backend tried fails
-	// before we've committed a response, letting us retry against the next
-	// healthy candidate instead of failing the whole request.
+	// Buffer the body once so a retry against a different backend can replay
+	// it; a request body is a stream and can only be read a single time.
 	var bodyBytes []byte
 	if r.Body != nil && r.Body != http.NoBody {
 		bodyBytes, _ = io.ReadAll(r.Body)
@@ -149,26 +311,35 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	var rec *statusRecorder
-	for _, backend := range candidates {
+
+	for attempt, backend := range candidates {
 		if bodyBytes != nil {
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			r.ContentLength = int64(len(bodyBytes))
 		}
+		if attempt > 0 {
+			lb.metrics.Retries.Add(1)
+		}
 
 		backend.InFlight.Add(1)
+		backend.Requests.Add(1)
+		attemptStart := time.Now()
+
 		rec = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		backend.proxy.ServeHTTP(rec, r)
+
 		backend.InFlight.Add(-1)
+		backend.observe(time.Since(attemptStart))
 
 		if !rec.failed {
 			break
 		}
-		// This backend's ErrorHandler marked the attempt failed without
-		// writing anything to the client (see below) — safe to retry the
-		// next candidate. Once a response has actually started streaming to
-		// the client this loop is not reached again, since ServeHTTP has
-		// already returned by then.
+
+		backend.Failures.Add(1)
+		// The ErrorHandler recorded the failure without writing to the client,
+		// so the next candidate can still serve this request cleanly.
 	}
+
 	lb.metrics.record(time.Since(start))
 
 	if rec.failed {
@@ -185,35 +356,50 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 	type backendStatus struct {
-		URL      string `json:"url"`
-		Alive    bool   `json:"alive"`
-		InFlight int64  `json:"in_flight"`
+		URL        string  `json:"url"`
+		Alive      bool    `json:"alive"`
+		InFlight   int64   `json:"in_flight"`
+		Score      float64 `json:"score"`
+		LatencyMs  float64 `json:"latency_ms"`
+		CPUPercent float64 `json:"cpu_percent"`
+		Requests   uint64  `json:"requests"`
+		Failures   uint64  `json:"failures"`
+		Messages   int64   `json:"stored_messages"`
+		Current    bool    `json:"current"`
 	}
+
+	current := lb.current.Load()
 	out := struct {
-		Backends []backendStatus `json:"backends"`
-	}{}
+		Threshold float64         `json:"threshold"`
+		Backends  []backendStatus `json:"backends"`
+	}{Threshold: lb.threshold}
+
 	for _, b := range lb.backends {
 		out.Backends = append(out.Backends, backendStatus{
-			URL:      b.URL.String(),
-			Alive:    b.Alive.Load(),
-			InFlight: b.InFlight.Load(),
+			URL:        b.URL.String(),
+			Alive:      b.Alive.Load(),
+			InFlight:   b.InFlight.Load(),
+			Score:      math.Round(lb.score(b)*100) / 100,
+			LatencyMs:  math.Round(b.LatencyMs()*100) / 100,
+			CPUPercent: b.CPUPercent(),
+			Requests:   b.Requests.Load(),
+			Failures:   b.Failures.Load(),
+			Messages:   b.StoredMsgs.Load(),
+			Current:    b == current,
 		})
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
 
-// statusRecorder captures the status code the backend responded with, since
-// the standard ResponseWriter does not expose it after the fact. It also
-// gives a backend's ErrorHandler a way to report failure (see below)
-// without writing to the real client, so LoadBalancer.ServeHTTP can retry a
-// different backend instead of the error being final.
+// statusRecorder captures the status a backend responded with, and gives that
+// backend's ErrorHandler a way to report failure without writing to the real
+// client, so ServeHTTP can retry elsewhere.
 //
-// It forwards Hijack explicitly because embedding only promotes the methods
-// declared on the http.ResponseWriter interface itself; without this, the
-// reverse proxy's WebSocket-upgrade path (which type-asserts for
-// http.Hijacker) would silently stop working and break the live chat's
-// Socket.IO connections whenever they go through the load balancer.
+// Hijack is forwarded explicitly: embedding only promotes the methods declared
+// on http.ResponseWriter, and without it the reverse proxy's WebSocket-upgrade
+// path would silently stop working and break the chat's Socket.IO connections.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -239,22 +425,20 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
-// healthLoop polls every backend's /health endpoint on a fixed interval and
-// flips Alive accordingly. A backend that starts failing proxied requests is
-// also marked dead immediately by the reverse proxy's ErrorHandler below;
-// this loop is what brings it back once it recovers.
+// healthLoop decides which backends are eligible for traffic at all. A backend
+// that fails a proxied request is marked down immediately by its ErrorHandler;
+// this loop is what lets it back in once it answers again.
 func (lb *LoadBalancer) healthLoop(interval, timeout time.Duration) {
 	client := &http.Client{Timeout: timeout}
+
 	for {
 		for _, b := range lb.backends {
-			healthURL := strings.TrimRight(b.URL.String(), "/") + "/health"
-			resp, err := client.Get(healthURL)
+			resp, err := client.Get(strings.TrimRight(b.URL.String(), "/") + "/health")
 			alive := err == nil && resp.StatusCode < 500
 			if resp != nil {
 				resp.Body.Close()
 			}
-			was := b.Alive.Swap(alive)
-			if was != alive {
+			if was := b.Alive.Swap(alive); was != alive {
 				log.Printf("backend %s health changed: alive=%v", b.URL, alive)
 			}
 		}
@@ -262,35 +446,211 @@ func (lb *LoadBalancer) healthLoop(interval, timeout time.Duration) {
 	}
 }
 
+// statsLoop pulls each backend's own view of itself — CPU, its internal queue
+// depth, how many messages it holds. CPU in particular cannot be inferred from
+// the balancer's side: a backend can look responsive right up to the point its
+// cores saturate, and this is the warning.
+func (lb *LoadBalancer) statsLoop(interval, timeout time.Duration) {
+	client := &http.Client{Timeout: timeout}
+
+	type statsResponse struct {
+		CPUPercent float64 `json:"cpuPercent"`
+		EwmaMs     float64 `json:"ewmaMs"`
+		Store      struct {
+			Messages int64 `json:"messages"`
+		} `json:"store"`
+	}
+
+	for {
+		for _, b := range lb.backends {
+			resp, err := client.Get(strings.TrimRight(b.URL.String(), "/") + "/stats")
+			if err != nil {
+				continue
+			}
+
+			var parsed statsResponse
+			decodeErr := json.NewDecoder(resp.Body).Decode(&parsed)
+			resp.Body.Close()
+			if decodeErr != nil {
+				continue
+			}
+
+			b.cpuCentis.Store(int64(parsed.CPUPercent * 100))
+			b.backendEwma.Store(int64(parsed.EwmaMs * 1000))
+			b.StoredMsgs.Store(parsed.Store.Messages)
+		}
+		time.Sleep(interval)
+	}
+}
+
+// --- listening on one port for both plain HTTP and TLS ---------------------
+//
+// The evaluation harness submits a plain http:// URL, while the chat client in
+// a browser needs https:// for the Web Crypto signing keys it depends on. Each
+// machine exposes exactly one port, so both have to arrive on the same one.
+//
+// They are trivially distinguishable: a TLS connection opens with a handshake
+// record whose first byte is 0x16, and an HTTP request opens with an ASCII
+// method name. Peeking that single byte is enough to hand the connection to
+// the right server, with the peeked byte pushed back so neither server sees a
+// truncated stream.
+
+type peekedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *peekedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+// chanListener is a net.Listener fed by hand rather than by the kernel, so one
+// real listener can drive two http.Servers.
+type chanListener struct {
+	conns  chan net.Conn
+	addr   net.Addr
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newChanListener(addr net.Addr) *chanListener {
+	return &chanListener{
+		conns:  make(chan net.Conn, 64),
+		addr:   addr,
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *chanListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *chanListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *chanListener) Addr() net.Addr { return l.addr }
+
+func (l *chanListener) push(conn net.Conn) {
+	select {
+	case l.conns <- conn:
+	case <-l.closed:
+		conn.Close()
+	}
+}
+
+func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	plainListener := newChanListener(listener.Addr())
+	tlsListener := newChanListener(listener.Addr())
+
+	newServer := func() *http.Server {
+		return &http.Server{
+			Handler: handler,
+			// Only the header read is bounded. Bounding the whole request or
+			// response would cut off long-lived WebSocket connections, which
+			// are exactly what the chat depends on.
+			ReadHeaderTimeout: 20 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	}
+
+	go func() {
+		if err := newServer().Serve(plainListener); err != nil && err != net.ErrClosed {
+			log.Printf("plain HTTP server stopped: %v", err)
+		}
+	}()
+
+	go func() {
+		if err := newServer().ServeTLS(tlsListener, certFile, keyFile); err != nil && err != net.ErrClosed {
+			log.Printf("TLS server stopped: %v", err)
+		}
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+
+		go func(conn net.Conn) {
+			reader := bufio.NewReader(conn)
+			// A slow or empty connection must not hold this goroutine forever.
+			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+			first, err := reader.Peek(1)
+			conn.SetReadDeadline(time.Time{})
+			if err != nil {
+				conn.Close()
+				return
+			}
+
+			wrapped := &peekedConn{Conn: conn, reader: reader}
+			if first[0] == 0x16 {
+				tlsListener.push(wrapped)
+			} else {
+				plainListener.push(wrapped)
+			}
+		}(conn)
+	}
+}
+
 func main() {
-	backendsFlag := flag.String("backends", "", "comma-separated list of backend base URLs, e.g. http://sys2:4000,http://sys3:4000,http://sys4:4000")
-	listenAddr := flag.String("listen", ":8080", "address the load balancer listens on")
+	backendsFlag := flag.String("backends", "", "comma-separated backend base URLs, e.g. http://10.1.75.53:3266,http://10.1.75.53:3267")
+	listenAddr := flag.String("listen", ":3000", "address the load balancer listens on")
 	healthInterval := flag.Duration("health-interval", 1*time.Second, "interval between backend health checks")
-	healthTimeout := flag.Duration("health-timeout", 800*time.Millisecond, "timeout for a single health check request")
-	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond, "timeout waiting for a backend's response headers")
-	dialTimeout := flag.Duration("dial-timeout", 800*time.Millisecond, "timeout connecting to a backend")
-	tlsCert := flag.String("tls-cert", "", "path to a TLS certificate file; if set with -tls-key, serve HTTPS instead of plain HTTP")
-	tlsKey := flag.String("tls-key", "", "path to the TLS certificate's private key file")
+	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "timeout for a single health check")
+	statsInterval := flag.Duration("stats-interval", 400*time.Millisecond, "interval between backend stats polls")
+	statsTimeout := flag.Duration("stats-timeout", 1*time.Second, "timeout for a single stats poll")
+	backendTimeout := flag.Duration("backend-timeout", 15*time.Second, "how long to wait for a backend's response headers")
+	dialTimeout := flag.Duration("dial-timeout", 2*time.Second, "timeout connecting to a backend")
+	threshold := flag.Float64("load-threshold", 4.0, "load score above which traffic switches to another backend")
+	wInFlight := flag.Float64("w-inflight", 1.0, "score weight for one outstanding request")
+	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
+	wCPU := flag.Float64("w-cpu", 0.10, "score weight per percent of backend CPU")
+	maxIdlePerHost := flag.Int("max-idle-per-host", 512, "idle keep-alive connections kept per backend")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate; with -tls-key, the same port also serves HTTPS")
+	tlsKey := flag.String("tls-key", "", "TLS certificate private key")
 	flag.Parse()
 
 	if *backendsFlag == "" {
 		log.Fatal("at least one -backends URL is required")
 	}
 
-	// Response-header timeout only bounds how long we wait for the backend
-	// to start responding; it does NOT cut off the connection afterwards.
-	// That distinction matters here because the backend also serves
-	// long-lived Socket.IO / WebSocket connections for the live chat, which
-	// must be allowed to stay open for as long as the client is connected.
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout: *dialTimeout,
+			Timeout:   *dialTimeout,
+			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ResponseHeaderTimeout: *backendTimeout,
+		// The default of 2 idle connections per host means almost every request
+		// under load pays for a fresh TCP handshake. At a thousand concurrent
+		// clients that cost dominates everything the backend actually does.
+		MaxIdleConnsPerHost: *maxIdlePerHost,
+		MaxIdleConns:        *maxIdlePerHost * 8,
+		IdleConnTimeout:     90 * time.Second,
+		// Let the client's own Accept-Encoding reach the backend and its
+		// compressed response come back untouched. Without this, Go would
+		// transparently decompress every /feed response here and the client
+		// would receive it uncompressed — paying for the compression twice and
+		// sending far more bytes than necessary.
+		DisableCompression: true,
+		ForceAttemptHTTP2:  false,
 	}
 
 	lb := &LoadBalancer{
-		metrics: &Metrics{maxSamples: 100_000},
+		metrics:   &Metrics{maxSamples: 100_000},
+		weights:   Weights{InFlight: *wInFlight, Latency: *wLatency, CPU: *wCPU},
+		threshold: *threshold,
 	}
 
 	for _, part := range strings.Split(*backendsFlag, ",") {
@@ -309,23 +669,15 @@ func main() {
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = transport
 		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-			// This fires for connection-establishment failures — dial
-			// errors, response-header timeouts — before any part of a
-			// response has been written to the real client. That means it
-			// is safe to leave rw untouched and let ServeHTTP's retry loop
-			// try the next healthy backend instead of failing the request
-			// outright. (It is only ever unsafe to retry after headers have
-			// already been committed to the client, which is not the case
-			// here — see the retry loop in LoadBalancer.ServeHTTP.)
+			// Fires for connection-establishment failures, before anything has
+			// been written to the client, so the request can still be retried
+			// against another backend.
 			b.Alive.Store(false)
 			lb.metrics.BackendErrors.Add(1)
-			log.Printf("backend %s error: %v", b.URL, err)
 			if rec, ok := rw.(*statusRecorder); ok {
 				rec.failed = true
 				return
 			}
-			// Should not normally happen — ServeHTTP always passes a
-			// *statusRecorder — but fail safe rather than hang the client.
 			http.Error(rw, "backend unavailable", http.StatusBadGateway)
 		}
 		b.proxy = proxy
@@ -333,22 +685,34 @@ func main() {
 		lb.backends = append(lb.backends, b)
 	}
 
-	go lb.healthLoop(*healthInterval, *healthTimeout)
+	if len(lb.backends) == 0 {
+		log.Fatal("no usable backends were parsed")
+	}
+	lb.current.Store(lb.backends[0])
 
-	// TLS terminates here, at the load balancer, and traffic to the
-	// backends stays plain HTTP — the browser only needs a secure context
-	// (required for the chat client's Web Crypto signing keys) up to this
-	// edge, and the backends are all on the same trusted internal network.
+	go lb.healthLoop(*healthInterval, *healthTimeout)
+	go lb.statsLoop(*statsInterval, *statsTimeout)
+
+	log.Printf(
+		"load balancer on %s | backends=%d threshold=%.2f weights(inflight=%.2f latency=%.3f cpu=%.2f)",
+		*listenAddr, len(lb.backends), lb.threshold, lb.weights.InFlight, lb.weights.Latency, lb.weights.CPU,
+	)
+
 	if *tlsCert != "" && *tlsKey != "" {
-		log.Printf("load balancer listening on %s (TLS), backends: %v", *listenAddr, *backendsFlag)
-		if err := http.ListenAndServeTLS(*listenAddr, *tlsCert, *tlsKey, lb); err != nil {
+		log.Printf("serving plain HTTP and HTTPS on the same port")
+		if err := serveMultiplexed(*listenAddr, lb, *tlsCert, *tlsKey); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	log.Printf("load balancer listening on %s, backends: %v", *listenAddr, *backendsFlag)
-	if err := http.ListenAndServe(*listenAddr, lb); err != nil {
-		log.Fatal(err)
+	server := &http.Server{
+		Addr:              *listenAddr,
+		Handler:           lb,
+		ReadHeaderTimeout: 20 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(fmt.Sprintf("server stopped: %v", err))
 	}
 }

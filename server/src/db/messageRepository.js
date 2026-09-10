@@ -1,4 +1,5 @@
 const { getDb } = require('./index');
+const { ulid } = require('../ids');
 
 const COLLECTION = 'messages';
 const DEFAULT_HISTORY_LIMIT = 100;
@@ -27,7 +28,14 @@ function collection() {
 }
 
 // Saves one message and returns the new id as a plain string.
+//
+// The id is generated here rather than left to MongoDB, so that a message has
+// its identity before it is written. That is what makes storing it idempotent:
+// the same message arriving twice — replayed by a peer machine, retried after a
+// timeout — lands on the same _id and collapses into one row instead of
+// appearing twice in the conversation.
 async function saveMessage({
+  id = ulid(),
   roomId,
   senderId,
   ciphertext,
@@ -37,7 +45,8 @@ async function saveMessage({
   timestamp = new Date(),
   clientTimestamp = null,
 }) {
-  const result = await collection().insertOne({
+  await collection().insertOne({
+    _id: id,
     roomId,
     senderId,
     ciphertext,
@@ -46,9 +55,12 @@ async function saveMessage({
     senderPublicKey,
     timestamp,
     clientTimestamp: clientTimestamp ?? timestamp.getTime(),
+    // Stamped by whichever machine wrote the row, so each machine can scan for
+    // what it has recently taken in without coordinating a shared sequence.
+    localInsertedAt: new Date(),
   });
 
-  return result.insertedId.toHexString();
+  return id;
 }
 
 // Returns the most recent messages for a room, oldest first.
@@ -68,7 +80,9 @@ async function getHistory(roomId, limit = DEFAULT_HISTORY_LIMIT) {
   documents.reverse();
 
   return documents.map((doc) => ({
-    id: doc._id.toHexString(),
+    // Ids are strings now, but rows written before that change still carry an
+    // ObjectId, so handle both rather than throwing on old history.
+    id: typeof doc._id === 'string' ? doc._id : doc._id.toHexString(),
     senderId: doc.senderId,
     // The driver hands binary fields back as a Binary wrapper, so unwrap them
     // into normal Buffers for the rest of the code to use.

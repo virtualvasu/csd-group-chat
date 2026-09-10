@@ -57,7 +57,15 @@ async function verifyStoredSignature(message, text) {
 }
 
 // Full list of events is in server/README.md
-function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
+// onMessageStored lets the caller record that a message has already been
+// broadcast from here. The feed store rebroadcasts everything it takes in —
+// including messages this handler stored — so without that note a message sent
+// over a socket would reach chat clients twice.
+function registerSocketHandlers(
+  io,
+  socket,
+  { presence, messageRateLimiter, onMessageStored = () => {} }
+) {
   // Wraps a handler so a thrown error tells the client something went wrong
   // instead of taking the server down. Handlers are async now that they talk
   // to the database, so we catch failed promises as well as thrown errors.
@@ -359,6 +367,8 @@ function registerSocketHandlers(io, socket, { presence, messageRateLimiter }) {
         signature,
         senderPublicKey: Buffer.from(publicKey, 'base64'),
       });
+
+      onMessageStored(id);
 
       io.emit('chat-message', {
         id,

@@ -30,12 +30,16 @@ async function connect() {
   const dbName = String(process.env.MONGODB_DB_NAME || '').trim() || DEFAULT_DB_NAME;
 
   client = new MongoClient(uri, {
-    // Give up after 10 seconds instead of hanging, so a wrong password or a
-    // missing IP in the Atlas access list shows up as an error right away.
+    // Give up rather than hanging, so a bad connection string shows up as an
+    // error at startup instead of as a stall on the first message.
     serverSelectionTimeoutMS: 10000,
-    // The Atlas free tier allows a limited number of connections, so keep the
-    // pool small. One lab server does not need more than this.
-    maxPoolSize: 10,
+    // Sized for a database on this machine rather than a shared cloud cluster.
+    // The old value of 10 was picked for the Atlas free tier's connection cap;
+    // against a local server it is simply a ceiling on how many messages can be
+    // in flight at once, and at a thousand concurrent clients that ceiling is
+    // the bottleneck rather than the database.
+    maxPoolSize: Number(process.env.MONGO_POOL_SIZE || 100),
+    minPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE || 8),
   });
 
   await client.connect();
@@ -52,6 +56,14 @@ async function createIndexes(database) {
   // History is always read for one room, oldest first, so index both fields
   // together in that order.
   await database.collection('messages').createIndex({ roomId: 1, _id: 1 });
+
+  // The incremental catch-up scan looks for rows this machine wrote since it
+  // last checked — that is how a worker process notices messages stored by a
+  // sibling worker or pushed here by a peer machine. Without this index that
+  // scan is a collection scan several times a second.
+  await database
+    .collection('messages')
+    .createIndex({ roomId: 1, localInsertedAt: 1 });
 }
 
 // Returns the open database. Throws if connect() has not finished yet, which
