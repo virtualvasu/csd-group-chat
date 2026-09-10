@@ -52,6 +52,12 @@ async function createIndexes(database) {
   // History is always read for one room, oldest first, so index both fields
   // together in that order.
   await database.collection('messages').createIndex({ roomId: 1, _id: 1 });
+
+  // Enforces the "no duplicate insertion on retry" requirement at the
+  // database level, across all backend processes sharing this cluster.
+  // Sparse because messages written before this field existed have none, and
+  // a non-sparse unique index would reject them all as colliding nulls.
+  await database.collection('messages').createIndex({ messageId: 1 }, { unique: true, sparse: true });
 }
 
 // Returns the open database. Throws if connect() has not finished yet, which

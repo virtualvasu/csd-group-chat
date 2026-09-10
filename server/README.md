@@ -8,10 +8,12 @@ server/
     presence.js            In-memory online-user store (socket.id -> username), duplicate-username check
     rateLimiter.js          Per-socket sliding-window rate limiter (5 events / 3s)
     validation.js            Username + message validation rules
+    chatHistory.js            Shared decrypt/verify/shape logic for stored messages (used by chat-history and GET /feed)
     socketHandlers.js         join / chat-message / disconnect event handlers, wrapped for error handling
     routes/health.js          GET /health liveness endpoint
+    routes/messages.js        POST /message + GET /feed (load-balancer assignment routes)
     db/index.js               MongoDB connection lifecycle (connect / getDb / close) and index setup
-    db/messageRepository.js    All message queries: saveMessage + getHistory
+    db/messageRepository.js    All message queries: saveMessage (idempotent, keyed by messageId) + getHistory
     db/senderRepository.js    TOFU identity store: first-seen public key per username
     crypto/messageCipher.js   AES-256-GCM encrypt / decrypt and the key loaded at startup
     crypto/canonical.js       Canonical signing payload builder (counterpart: client/src/lib/canonical.ts)
@@ -51,6 +53,7 @@ startup error rather than a surprise on the first message.
 | Field | Type | Notes |
 |---|---|---|
 | `_id` | ObjectId | Also the message id sent to clients, as a 24-character hex string |
+| `messageId` | string | Idempotency key. Caller-supplied (e.g. from `POST /message`'s optional `id` field) or server-generated. Unique, sparse index — see "Idempotent inserts" below |
 | `roomId` | string | Always `main` for now |
 | `senderId` | string | The username that sent the message |
 | `ciphertext` | Binary | The encrypted message, with the 16-byte authentication tag on the end |
@@ -64,6 +67,20 @@ Only the message body is encrypted. The sender, the room and the timestamp are
 stored as they are, because history is read and sorted by them.
 
 Index: `{ roomId: 1, _id: 1 }`, matching how history is read (one room, in order).
+Index: `{ messageId: 1 }` (unique, sparse), enforcing the idempotent-insert rule below.
+
+### Idempotent inserts
+
+`saveMessage` writes with `updateOne({ messageId }, { $setOnInsert: {...} }, { upsert: true })`
+instead of `insertOne`, the same pattern `senderRepository.registerSender` already
+uses for identities. All three backend processes share one MongoDB cluster, so a
+message that arrives more than once — a client retry after a timeout, a
+reconnect, the load balancer retrying a different backend — collides on the same
+`messageId` and is written at most once; every later arrival just gets back the
+id that was already stored (`{ id, messageId, duplicate: true }`). A caller that
+omits `messageId` (the Socket.IO chat path) gets one generated for it, so every
+message still has a unique id, just without retry-safety — that path is not
+retried by the client today.
 
 ### `senders` collection (new — Issue #14)
 
@@ -148,6 +165,37 @@ Liveness check. Returns:
 ```json
 { "status": "ok", "uptimeSeconds": 42, "onlineUsers": 3 }
 ```
+
+### `POST /message`
+
+Load-balancer assignment route (`src/routes/messages.js`). Unauthenticated
+alternative to the signed Socket.IO `chat-message` path, for load generators
+and any client without a signing key. Request body:
+
+```json
+{ "client-name": "alice", "msg": "hello", "id": "optional idempotency key" }
+```
+
+`client-name` and `msg` are validated with the same rules as the socket path
+(username format, 500-char message limit). `id` is optional; if given, retried
+requests using the same `id` are deduplicated (see "Idempotent inserts"). The
+message is encrypted and stored in the same `messages` collection as the chat
+UI, and broadcast to connected Socket.IO clients as `chat-message` with
+`signature: 'unsigned'` — one shared feed, two ways to add to it. Responds
+`201 { id, duplicate }`, or `400` on a validation error.
+
+### `GET /feed`
+
+Load-balancer assignment route. Returns every stored message for the room,
+decrypted, in the same shape as `chat-history`:
+
+```json
+{ "messages": [ { "id", "username", "text", "timestamp", "signature", "senderPublicKey", "stored" }, ... ] }
+```
+
+Unlike `chat-history` (capped at the most recent 100 on join), this returns
+the full history — the load generator needs to see everything it posted, not
+a windowed view.
 
 ## Socket.IO event contract
 

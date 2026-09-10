@@ -90,25 +90,60 @@ type LoadBalancer struct {
 	backends []*Backend
 	next     atomic.Uint64
 	metrics  *Metrics
+
+	// OverloadThreshold is the in-flight-request count at or above which a
+	// backend is treated as overloaded: still eligible if nothing better is
+	// available, but never preferred over a less-loaded one. 0 disables
+	// this (pure least-connections, no threshold-based demotion). See
+	// REPORT.md for how this value was picked.
+	OverloadThreshold int64
 }
 
-// candidateBackends returns every currently-healthy backend, starting from
-// the shared round-robin cursor and wrapping around once. Callers try them
-// in this order, falling through to the next one if a request fails, so a
-// single backend erroring out under load does not fail the request outright
-// as long as another healthy backend exists.
+// candidateBackends returns every currently-healthy backend, ordered
+// least-loaded first (by current in-flight request count — the load signal
+// the load balancer already has for free, with no backend cooperation
+// needed). Callers try them in this order, falling through to the next one
+// if a request fails.
+//
+// This is performance-based dynamic selection, not fixed round-robin: which
+// backend is "first" changes request to request as load shifts between
+// them. A backend at or above OverloadThreshold is pushed to the back of the
+// list — still used as a last resort so a request is never dropped while any
+// backend is alive, but only after every less-loaded backend has been tried.
+// The round-robin cursor still rotates the starting point on each call so
+// that backends sitting at equal load (e.g. all idle) are spread across
+// evenly instead of always favoring the same one.
 func (lb *LoadBalancer) candidateBackends() []*Backend {
 	n := len(lb.backends)
 	if n == 0 {
 		return nil
 	}
 	start := int(lb.next.Add(1) % uint64(n))
-	candidates := make([]*Backend, 0, n)
+
+	type scored struct {
+		backend  *Backend
+		inFlight int64
+	}
+	alive := make([]scored, 0, n)
 	for i := 0; i < n; i++ {
 		b := lb.backends[(start+i)%n]
 		if b.Alive.Load() {
-			candidates = append(candidates, b)
+			alive = append(alive, scored{backend: b, inFlight: b.InFlight.Load()})
 		}
+	}
+
+	sort.SliceStable(alive, func(i, j int) bool {
+		iOverloaded := lb.OverloadThreshold > 0 && alive[i].inFlight >= lb.OverloadThreshold
+		jOverloaded := lb.OverloadThreshold > 0 && alive[j].inFlight >= lb.OverloadThreshold
+		if iOverloaded != jOverloaded {
+			return !iOverloaded
+		}
+		return alive[i].inFlight < alive[j].inFlight
+	})
+
+	candidates := make([]*Backend, len(alive))
+	for i, s := range alive {
+		candidates[i] = s.backend
 	}
 	return candidates
 }
@@ -185,18 +220,22 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (lb *LoadBalancer) writeStatus(w http.ResponseWriter) {
 	type backendStatus struct {
-		URL      string `json:"url"`
-		Alive    bool   `json:"alive"`
-		InFlight int64  `json:"in_flight"`
+		URL        string `json:"url"`
+		Alive      bool   `json:"alive"`
+		InFlight   int64  `json:"in_flight"`
+		Overloaded bool   `json:"overloaded"`
 	}
 	out := struct {
-		Backends []backendStatus `json:"backends"`
-	}{}
+		OverloadThreshold int64           `json:"overload_threshold"`
+		Backends          []backendStatus `json:"backends"`
+	}{OverloadThreshold: lb.OverloadThreshold}
 	for _, b := range lb.backends {
+		inFlight := b.InFlight.Load()
 		out.Backends = append(out.Backends, backendStatus{
-			URL:      b.URL.String(),
-			Alive:    b.Alive.Load(),
-			InFlight: b.InFlight.Load(),
+			URL:        b.URL.String(),
+			Alive:      b.Alive.Load(),
+			InFlight:   inFlight,
+			Overloaded: lb.OverloadThreshold > 0 && inFlight >= lb.OverloadThreshold,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -269,6 +308,7 @@ func main() {
 	healthTimeout := flag.Duration("health-timeout", 800*time.Millisecond, "timeout for a single health check request")
 	backendTimeout := flag.Duration("backend-timeout", 800*time.Millisecond, "timeout waiting for a backend's response headers")
 	dialTimeout := flag.Duration("dial-timeout", 800*time.Millisecond, "timeout connecting to a backend")
+	maxInFlight := flag.Int64("max-inflight", 8, "in-flight requests on a backend at or above which it is treated as overloaded and only used if no less-loaded backend is available; 0 disables this")
 	tlsCert := flag.String("tls-cert", "", "path to a TLS certificate file; if set with -tls-key, serve HTTPS instead of plain HTTP")
 	tlsKey := flag.String("tls-key", "", "path to the TLS certificate's private key file")
 	flag.Parse()
@@ -290,7 +330,8 @@ func main() {
 	}
 
 	lb := &LoadBalancer{
-		metrics: &Metrics{maxSamples: 100_000},
+		metrics:           &Metrics{maxSamples: 100_000},
+		OverloadThreshold: *maxInFlight,
 	}
 
 	for _, part := range strings.Split(*backendsFlag, ",") {
@@ -340,14 +381,14 @@ func main() {
 	// (required for the chat client's Web Crypto signing keys) up to this
 	// edge, and the backends are all on the same trusted internal network.
 	if *tlsCert != "" && *tlsKey != "" {
-		log.Printf("load balancer listening on %s (TLS), backends: %v", *listenAddr, *backendsFlag)
+		log.Printf("load balancer listening on %s (TLS), backends: %v, max-inflight: %d", *listenAddr, *backendsFlag, *maxInFlight)
 		if err := http.ListenAndServeTLS(*listenAddr, *tlsCert, *tlsKey, lb); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	log.Printf("load balancer listening on %s, backends: %v", *listenAddr, *backendsFlag)
+	log.Printf("load balancer listening on %s, backends: %v, max-inflight: %d", *listenAddr, *backendsFlag, *maxInFlight)
 	if err := http.ListenAndServe(*listenAddr, lb); err != nil {
 		log.Fatal(err)
 	}

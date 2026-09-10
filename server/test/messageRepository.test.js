@@ -12,15 +12,14 @@ async function saveAll(texts, roomId = ROOM) {
   const ids = [];
 
   for (const text of texts) {
-    ids.push(
-      // Saved one at a time so the ids stay in the same order as the texts.
-      // eslint-disable-next-line no-await-in-loop
-      await saveMessage({
-        roomId,
-        senderId: 'Asha',
-        ciphertext: Buffer.from(text, 'utf8'),
-      })
-    );
+    // Saved one at a time so the ids stay in the same order as the texts.
+    // eslint-disable-next-line no-await-in-loop
+    const { id } = await saveMessage({
+      roomId,
+      senderId: 'Asha',
+      ciphertext: Buffer.from(text, 'utf8'),
+    });
+    ids.push(id);
   }
 
   return ids;
@@ -48,7 +47,7 @@ test.after(async () => {
 test('a saved message comes back with the same content', { skip }, async () => {
   const timestamp = new Date();
 
-  const id = await saveMessage({
+  const { id } = await saveMessage({
     roomId: ROOM,
     senderId: 'Kunal',
     ciphertext: Buffer.from('hello there', 'utf8'),
@@ -98,6 +97,45 @@ test('the fields used later for signing default to empty', { skip }, async () =>
 
   assert.equal(message.signature, null);
   assert.equal(message.senderPublicKey, null);
+});
+
+test('saving the same messageId twice does not insert a duplicate', { skip }, async () => {
+  const first = await saveMessage({
+    roomId: ROOM,
+    senderId: 'Asha',
+    ciphertext: Buffer.from('retry me', 'utf8'),
+    messageId: 'client-generated-id-1',
+  });
+  const second = await saveMessage({
+    roomId: ROOM,
+    senderId: 'Asha',
+    ciphertext: Buffer.from('retry me', 'utf8'),
+    messageId: 'client-generated-id-1',
+  });
+
+  assert.equal(first.duplicate, false);
+  assert.equal(second.duplicate, true);
+  assert.equal(second.id, first.id);
+
+  const history = await getHistory(ROOM);
+  assert.equal(history.length, 1);
+});
+
+test('messages without a messageId still each get their own unique id', { skip }, async () => {
+  const first = await saveMessage({
+    roomId: ROOM,
+    senderId: 'Asha',
+    ciphertext: Buffer.from('one', 'utf8'),
+  });
+  const second = await saveMessage({
+    roomId: ROOM,
+    senderId: 'Asha',
+    ciphertext: Buffer.from('two', 'utf8'),
+  });
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(first.duplicate, false);
+  assert.equal(second.duplicate, false);
 });
 
 test('the nonce is stored and returned alongside the message', { skip }, async () => {

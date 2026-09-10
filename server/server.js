@@ -8,6 +8,7 @@ const { RateLimiter } = require('./src/rateLimiter');
 const { registerSocketHandlers } = require('./src/socketHandlers');
 const { createHealthRouter } = require('./src/routes/health');
 const { createLoadTestRouter } = require('./src/routes/loadtest');
+const { createMessagesRouter } = require('./src/routes/messages');
 const { loadKey } = require('./src/crypto/messageCipher');
 const db = require('./src/db');
 
@@ -22,9 +23,11 @@ const PORT = process.env.PORT || 4000;
 const presence = new Presence();
 const messageRateLimiter = new RateLimiter();
 
+app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
 app.use(createHealthRouter(presence));
 app.use(createLoadTestRouter());
+app.use(createMessagesRouter(io));
 
 // Connect to the database before listening. If we started listening first, a
 // client could send a message before the database was ready and that message
