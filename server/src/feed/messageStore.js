@@ -76,6 +76,9 @@ class MessageStore extends EventEmitter {
     this.lastRebuildMs = 0;
     this.snapshots = new Array(SNAPSHOT_BUFFERS).fill(null);
     this.snapshotSlot = 0;
+    // How far past the cap the conversation may grow before it is trimmed.
+    // Larger slack means the costly re-lay happens proportionally less often.
+    this.trimSlack = Math.max(1000, Math.floor(this.options.maxMessages * 0.1));
 
     this.cache = { plain: Buffer.from('[]'), gzip: null, count: 0, builtAt: 0 };
     this.dirty = true;
@@ -371,7 +374,14 @@ class MessageStore extends EventEmitter {
     this.checksum = (this.checksum ^ hashId(message.id)) | 0;
     this.appendBytes(message);
 
-    if (this.messages.length > this.options.maxMessages) {
+    // Trimming re-lays the whole serialised body, so it is done in batches
+    // once the conversation has overrun the cap by a margin — never per
+    // message. Trimming the moment the cap is passed meant every subsequent
+    // message re-serialised the entire conversation, which at thirty thousand
+    // messages is thirty thousand stringify calls and as many allocations, per
+    // request. That is what killed the backends: the load itself was fine, the
+    // conversation simply grew past the cap mid-run.
+    if (this.messages.length >= this.options.maxMessages + this.trimSlack) {
       this.trim();
     }
 
