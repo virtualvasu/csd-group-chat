@@ -46,6 +46,10 @@ type Backend struct {
 	ewmaMicros atomic.Int64
 	Requests   atomic.Uint64
 	Failures   atomic.Uint64
+	// Consecutive failures, reset by any success. A backend is only taken out
+	// of rotation once this crosses a threshold — one slow response is not
+	// evidence that a backend is down.
+	consecutive atomic.Int64
 
 	// Reported by the backend and refreshed by the stats poller. CPU is held
 	// as hundredths of a percent so it can live in an atomic integer.
@@ -394,6 +398,10 @@ func (lb *LoadBalancer) score(b *Backend) float64 {
 // backend takes over and becomes current.
 const maxTrackedBackends = 16
 
+// How many consecutive failures, with no success in between, before a backend
+// is taken out of rotation.
+var failureThreshold int64 = 5
+
 // candidates fills dst with the healthy backends, best first, and returns the
 // filled prefix. The caller supplies the array so that choosing a backend —
 // which happens on every single request — allocates nothing.
@@ -425,8 +433,23 @@ func (lb *LoadBalancer) candidates(dst *[maxTrackedBackends]*Backend) []*Backend
 		count++
 	}
 
+	// Every backend marked down is far more often a symptom of the balancer
+	// having been too quick to eject them than of three machines genuinely
+	// failing at once. Refusing the request outright guarantees an error;
+	// trying anyway might succeed, and if the backends really are down the
+	// caller gets the same failure either way. So fail open.
 	if count == 0 {
-		return nil
+		for _, b := range lb.backends {
+			if count == maxTrackedBackends {
+				break
+			}
+			dst[count] = b
+			count++
+		}
+		if count == 0 {
+			return nil
+		}
+		return dst[:count]
 	}
 
 	// The threshold rule: stay on the backend currently carrying traffic while
@@ -548,6 +571,9 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		backend.observe(time.Since(attemptStart))
 
 		if !rec.failed {
+			// A success is proof the backend is serving, so the failure run
+			// starts again from zero.
+			backend.consecutive.Store(0)
 			break
 		}
 
@@ -653,6 +679,11 @@ func (lb *LoadBalancer) healthLoop(interval, timeout time.Duration) {
 			alive := err == nil && resp.StatusCode < 500
 			if resp != nil {
 				resp.Body.Close()
+			}
+			if alive {
+				// The probe answered, so whatever run of request failures was
+				// building is no longer evidence of anything.
+				b.consecutive.Store(0)
 			}
 			if was := b.Alive.Swap(alive); was != alive {
 				log.Printf("backend %s health changed: alive=%v", b.URL, alive)
@@ -895,6 +926,7 @@ func main() {
 	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
 	wCPU := flag.Float64("w-cpu", 0.10, "score weight per percent of backend CPU")
 	maxIdlePerHost := flag.Int("max-idle-per-host", 256, "idle keep-alive connections kept per backend")
+	flag.Int64Var(&failureThreshold, "failure-threshold", failureThreshold, "consecutive failures before a backend is ejected")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate; with -tls-key, the same port also serves HTTPS")
@@ -967,8 +999,20 @@ func main() {
 			// Fires for connection-establishment failures, before anything has
 			// been written to the client, so the request can still be retried
 			// against another backend.
-			b.Alive.Store(false)
 			lb.metrics.BackendErrors.Add(1)
+
+			// Ejecting on a single error is what produced the cascade: one slow
+			// response took a backend out, its share moved to the others, they
+			// saturated and were taken out in turn, until nothing was left to
+			// route to and every request became a 503. A backend has to fail
+			// repeatedly, with no success in between, before it is believed to
+			// be down.
+			if b.consecutive.Add(1) >= failureThreshold {
+				if b.Alive.Swap(false) {
+					log.Printf("backend %s ejected after %d consecutive failures", b.URL, failureThreshold)
+				}
+			}
+
 			if rec, ok := rw.(*statusRecorder); ok {
 				rec.failed = true
 				return
