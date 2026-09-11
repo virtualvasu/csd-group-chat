@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -223,7 +224,10 @@ func applyMemoryLimit() {
 		return
 	}
 
-	soft := int64(float64(limit) * 0.70)
+	// Only a minority of the budget goes to the heap. The rest is kernel
+	// socket memory, which is charged to the same cgroup and which the Go
+	// runtime neither sees nor accounts for.
+	soft := int64(float64(limit) * 0.35)
 	debug.SetMemoryLimit(soft)
 	log.Printf("memory limit: cgroup %dMB, GC soft limit set to %dMB",
 		limit/(1<<20), soft/(1<<20))
@@ -707,6 +711,32 @@ func (lb *LoadBalancer) statsLoop(interval, timeout time.Duration) {
 // the right server, with the peeked byte pushed back so neither server sees a
 // truncated stream.
 
+// Socket buffer sizes, in bytes. Small enough that a few thousand connections
+// cannot exhaust the container, large enough to carry a compressed feed
+// response without stalling.
+var (
+	socketReadBuffer  = 32 * 1024
+	socketWriteBuffer = 64 * 1024
+)
+
+// capSocketBuffers pins a connection's kernel buffers instead of letting Linux
+// auto-tune them.
+//
+// This is the memory the balancer was actually dying on. Go's heap limit does
+// not cover it: send and receive buffers live in the kernel, are charged to
+// this container's 512MB, and grow on their own as a connection gets busy. A
+// thousand client connections plus the pool to the backends was enough to run
+// the whole container out of memory, repeatedly, while the Go heap itself
+// stayed small.
+func capSocketBuffers(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tcp.SetReadBuffer(socketReadBuffer)
+	tcp.SetWriteBuffer(socketWriteBuffer)
+}
+
 type peekedConn struct {
 	net.Conn
 	reader *bufio.Reader
@@ -822,8 +852,16 @@ func serveMultiplexed(addr string, handler http.Handler, certFile, keyFile strin
 		}
 		backoff = 0
 
+		// Linux auto-tunes socket buffers upward under load, and every byte of
+		// that is charged to this container. Left alone, a few hundred busy
+		// connections is enough to exhaust the whole 512MB budget.
+		capSocketBuffers(conn)
+
 		go func(conn net.Conn) {
-			reader := bufio.NewReader(conn)
+			// One byte is all this reads. The default 4KB buffer, multiplied by
+			// every concurrent connection, is memory spent for nothing — the
+			// http server allocates its own buffers behind this.
+			reader := bufio.NewReaderSize(conn, 64)
 			// A slow or empty connection must not hold this goroutine forever.
 			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 			first, err := reader.Peek(1)
@@ -856,7 +894,9 @@ func main() {
 	wInFlight := flag.Float64("w-inflight", 1.0, "score weight for one outstanding request")
 	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
 	wCPU := flag.Float64("w-cpu", 0.10, "score weight per percent of backend CPU")
-	maxIdlePerHost := flag.Int("max-idle-per-host", 512, "idle keep-alive connections kept per backend")
+	maxIdlePerHost := flag.Int("max-idle-per-host", 64, "idle keep-alive connections kept per backend")
+	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
+	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate; with -tls-key, the same port also serves HTTPS")
 	tlsKey := flag.String("tls-key", "", "TLS certificate private key")
 	flag.Parse()
@@ -869,17 +909,29 @@ func main() {
 	raiseFileLimit()
 	applyMemoryLimit()
 
+	dialer := &net.Dialer{
+		Timeout:   *dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+
 	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   *dialTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		// Connections to the backends get their buffers capped too. The pool
+		// below holds a lot of them, and each one's kernel buffers count
+		// against the same container budget as the client connections do.
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			capSocketBuffers(conn)
+			return conn, nil
+		},
 		ResponseHeaderTimeout: *backendTimeout,
 		// The default of 2 idle connections per host means almost every request
 		// under load pays for a fresh TCP handshake. At a thousand concurrent
 		// clients that cost dominates everything the backend actually does.
 		MaxIdleConnsPerHost: *maxIdlePerHost,
-		MaxIdleConns:        *maxIdlePerHost * 8,
+		MaxIdleConns:        *maxIdlePerHost * 4,
 		IdleConnTimeout:     90 * time.Second,
 		// Let the client's own Accept-Encoding reach the backend and its
 		// compressed response come back untouched. Without this, Go would
