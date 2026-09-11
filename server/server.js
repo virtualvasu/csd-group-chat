@@ -128,7 +128,7 @@ async function start() {
   // declines to take, so behaviour cannot drift between the two.
   fastPath = createFastPath({ store, replicator, tracker });
   app.use(createApiRouter({ store, replicator, tracker, reconciler }));
-  app.use(createHealthRouter(presence));
+  app.use(createHealthRouter(presence, store));
   app.use(createLoadTestRouter());
   app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
 

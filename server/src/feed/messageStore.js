@@ -93,6 +93,11 @@ class MessageStore extends EventEmitter {
     this.timers = [];
 
     this.counters = { accepted: 0, duplicates: 0, replicated: 0, writeErrors: 0 };
+
+    // Whether the database is reachable. A backend that cannot persist is not
+    // healthy, however well it can still serve reads from memory, and the
+    // balancer needs to know that so it can route around it.
+    this.dbHealthy = true;
   }
 
   collection() {
@@ -447,9 +452,11 @@ class MessageStore extends EventEmitter {
 
     try {
       await this.writeBatch(batch.map((entry) => entry.doc));
+      this.dbHealthy = true;
       for (const entry of batch) entry.resolve();
     } catch (err) {
       this.counters.writeErrors += 1;
+      this.dbHealthy = false;
       for (const entry of batch) entry.reject(err);
     } finally {
       this.flushing = false;
@@ -602,6 +609,20 @@ class MessageStore extends EventEmitter {
         }, this.options.pollMs)
       );
     }
+
+    // Without this, a backend with no traffic would keep reporting healthy
+    // indefinitely after losing its database, because nothing would have tried
+    // to write.
+    timers.push(
+      setInterval(async () => {
+        try {
+          await this.db.command({ ping: 1 });
+          this.dbHealthy = true;
+        } catch {
+          this.dbHealthy = false;
+        }
+      }, 2000)
+    );
 
     for (const timer of timers) {
       if (typeof timer.unref === 'function') timer.unref();
