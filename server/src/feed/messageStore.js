@@ -23,6 +23,10 @@ const { toBuffer, COLLECTION } = require('../db/messageRepository');
 // Messages stay encrypted at rest, exactly as before. Decryption happens once,
 // when a message enters this process, not once per read.
 
+// How many snapshot buffers to rotate through. Deep enough that a buffer is
+// not overwritten until long after any response written from it has drained.
+const SNAPSHOT_BUFFERS = 4;
+
 const DEFAULTS = {
   roomId: 'main',
   // Larger than a full evaluation run (20,000 requests), so in practice a run
@@ -70,6 +74,8 @@ class MessageStore extends EventEmitter {
     this.bodyLen = 1;
     this.checksum = 0;
     this.lastRebuildMs = 0;
+    this.snapshots = new Array(SNAPSHOT_BUFFERS).fill(null);
+    this.snapshotSlot = 0;
 
     this.cache = { plain: Buffer.from('[]'), gzip: null, count: 0, builtAt: 0 };
     this.dirty = true;
@@ -297,6 +303,24 @@ class MessageStore extends EventEmitter {
     return added;
   }
 
+  // Hands back one of a fixed set of buffers, grown in place when the feed
+  // outgrows them, so the steady state allocates nothing. Returns a view of
+  // exactly the requested length.
+  takeSnapshotBuffer(size) {
+    const slot = this.snapshotSlot % SNAPSHOT_BUFFERS;
+    this.snapshotSlot += 1;
+
+    let buffer = this.snapshots[slot];
+    if (!buffer || buffer.length < size) {
+      // Grow with headroom so a steadily growing feed does not reallocate on
+      // every single rebuild.
+      buffer = Buffer.allocUnsafe(Math.max(size * 2, 64 * 1024));
+      this.snapshots[slot] = buffer;
+    }
+
+    return buffer.subarray(0, size);
+  }
+
   ensureCapacity(extra) {
     // +1 leaves room for the closing bracket a snapshot appends.
     const needed = this.bodyLen + extra + 1;
@@ -474,7 +498,18 @@ class MessageStore extends EventEmitter {
     // A snapshot, not a view of the live buffer: the response may still be
     // being written to a socket when the next message appends, and that append
     // would otherwise overwrite the closing bracket mid-flight.
-    const plain = Buffer.allocUnsafe(this.bodyLen + 1);
+    //
+    // The snapshots are taken from a small rotation of reused buffers rather
+    // than allocated fresh each time. At thirty thousand messages a snapshot is
+    // five and a half megabytes, and allocating one every rebuild produced
+    // twenty megabytes a second of garbage — which is survivable when the
+    // collector can keep up, and is not when the core is already saturated.
+    // These buffers are outside the V8 heap, so --max-old-space-size does not
+    // bound them; only not allocating them does.
+    //
+    // Rotating several deep means a buffer is not reused until well after any
+    // response written from it has finished.
+    const plain = this.takeSnapshotBuffer(this.bodyLen + 1);
     this.body.copy(plain, 0, 0, this.bodyLen);
     plain[this.bodyLen] = 0x5d; // ']'
 
@@ -530,7 +565,17 @@ class MessageStore extends EventEmitter {
     // for a threadpool slot, so under load the delay grew without bound and the
     // feed silently stopped updating — the one failure mode that matters here,
     // since a stale feed is a wrong answer rather than a slow one.
-    timers.push(setInterval(() => this.rebuild(), this.options.rebuildMs));
+    // The interval widens as the conversation grows: snapshotting and
+    // compressing five megabytes is not worth doing four times a second, and
+    // a second of staleness on a feed is not something a reader can detect.
+    // Bounded at both ends so it can never run away, which is what broke the
+    // earlier attempt at pacing this.
+    timers.push(
+      setInterval(() => {
+        const due = Math.min(1000, Math.max(this.options.rebuildMs, this.bodyLen / 8000));
+        if (Date.now() - this.cache.builtAt >= due) this.rebuild();
+      }, this.options.rebuildMs)
+    );
 
     // The rescan only exists to notice rows written by a *sibling worker
     // process* sharing this machine's database. Messages this process accepted,
