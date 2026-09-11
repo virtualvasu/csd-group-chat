@@ -715,8 +715,8 @@ func (lb *LoadBalancer) statsLoop(interval, timeout time.Duration) {
 // cannot exhaust the container, large enough to carry a compressed feed
 // response without stalling.
 var (
-	socketReadBuffer  = 32 * 1024
-	socketWriteBuffer = 64 * 1024
+	socketReadBuffer  = 16 * 1024
+	socketWriteBuffer = 32 * 1024
 )
 
 // capSocketBuffers pins a connection's kernel buffers instead of letting Linux
@@ -894,7 +894,7 @@ func main() {
 	wInFlight := flag.Float64("w-inflight", 1.0, "score weight for one outstanding request")
 	wLatency := flag.Float64("w-latency", 0.05, "score weight per millisecond of smoothed latency")
 	wCPU := flag.Float64("w-cpu", 0.10, "score weight per percent of backend CPU")
-	maxIdlePerHost := flag.Int("max-idle-per-host", 64, "idle keep-alive connections kept per backend")
+	maxIdlePerHost := flag.Int("max-idle-per-host", 256, "idle keep-alive connections kept per backend")
 	flag.IntVar(&socketReadBuffer, "socket-read-buffer", socketReadBuffer, "per-connection kernel read buffer, bytes")
 	flag.IntVar(&socketWriteBuffer, "socket-write-buffer", socketWriteBuffer, "per-connection kernel write buffer, bytes")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate; with -tls-key, the same port also serves HTTPS")
