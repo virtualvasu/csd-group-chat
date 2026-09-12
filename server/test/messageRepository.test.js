@@ -50,7 +50,7 @@ test('a saved message comes back with the same content', { skip }, async () => {
 
   const id = await saveMessage({
     roomId: ROOM,
-    senderId: 'Kunal',
+    senderId: 'Vasu',
     ciphertext: Buffer.from('hello there', 'utf8'),
     timestamp,
   });
@@ -59,7 +59,7 @@ test('a saved message comes back with the same content', { skip }, async () => {
 
   assert.equal(history.length, 1);
   assert.equal(history[0].id, id);
-  assert.equal(history[0].senderId, 'Kunal');
+  assert.equal(history[0].senderId, 'Vasu');
   assert.equal(history[0].ciphertext.toString('utf8'), 'hello there');
   assert.equal(history[0].timestamp.getTime(), timestamp.getTime());
 });

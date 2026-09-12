@@ -94,7 +94,7 @@ test('a broadcast message carries the id it was stored under', { skip }, async (
 
 test('someone joining later receives the earlier messages', { skip }, async () => {
   const asha = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const first = connectClient();
 
   try {
@@ -108,7 +108,7 @@ test('someone joining later receives the earlier messages', { skip }, async () =
 
     try {
       await waitForEvent(second, 'connect');
-      const history = await loginAs(second, 'Kunal', kunal);
+      const history = await loginAs(second, 'Vasu', vasu);
 
       assert.deepEqual(
         history.map((message) => message.text),
@@ -126,7 +126,7 @@ test('someone joining later receives the earlier messages', { skip }, async () =
 
 test('messages survive a server restart', { skip }, async () => {
   const asha = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const client = connectClient();
 
   try {
@@ -159,7 +159,7 @@ test('messages survive a server restart', { skip }, async () => {
 
   try {
     await waitForEvent(afterRestart, 'connect');
-    const history = await loginAs(afterRestart, 'Kunal', kunal);
+    const history = await loginAs(afterRestart, 'Vasu', vasu);
 
     assert.deepEqual(
       history.map((message) => message.text),
@@ -192,7 +192,7 @@ test('a stored message does not hold readable text', { skip }, async () => {
 
 test('a tampered message is flagged and the others still load', { skip }, async () => {
   const asha = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const first = connectClient();
 
   try {
@@ -215,7 +215,7 @@ test('a tampered message is flagged and the others still load', { skip }, async 
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await loginAs(second, 'Kunal', kunal);
+    const history = await loginAs(second, 'Vasu', vasu);
 
     assert.equal(history.length, 2);
     assert.equal(history[0].text, 'safe one');
@@ -324,7 +324,7 @@ test('a message carries the stored ciphertext alongside its text', { skip }, asy
 
 test('a signature still verifies after a round trip through storage', { skip }, async () => {
   const identity = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const first = connectClient();
 
   try {
@@ -339,7 +339,7 @@ test('a signature still verifies after a round trip through storage', { skip }, 
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await loginAs(second, 'Kunal', kunal);
+    const history = await loginAs(second, 'Vasu', vasu);
 
     assert.equal(history.length, 1);
     assert.equal(history[0].text, 'signed and stored');
@@ -353,7 +353,7 @@ test('a signature still verifies after a round trip through storage', { skip }, 
 
 test('editing a stored signature is caught but leaves the text readable', { skip }, async () => {
   const identity = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const first = connectClient();
 
   try {
@@ -375,7 +375,7 @@ test('editing a stored signature is caught but leaves the text readable', { skip
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await loginAs(second, 'Kunal', kunal);
+    const history = await loginAs(second, 'Vasu', vasu);
 
     // The message is readable and its bytes are intact, so integrity passes.
     // What failed is the claim about who wrote it.
@@ -389,7 +389,7 @@ test('editing a stored signature is caught but leaves the text readable', { skip
 
 test('a message that will not decrypt is not blamed on its sender', { skip }, async () => {
   const identity = await createIdentity();
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const first = connectClient();
 
   try {
@@ -410,7 +410,7 @@ test('a message that will not decrypt is not blamed on its sender', { skip }, as
 
   try {
     await waitForEvent(second, 'connect');
-    const history = await loginAs(second, 'Kunal', kunal);
+    const history = await loginAs(second, 'Vasu', vasu);
 
     assert.equal(history[0].text, null);
     assert.equal(history[0].integrity, 'failed');

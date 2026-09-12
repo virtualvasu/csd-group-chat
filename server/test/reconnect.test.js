@@ -55,7 +55,7 @@ test.after(async () => {
 // Logging in reads and writes the sender key store, so this one needs a
 // database even though what it is really checking is presence bookkeeping.
 test('rejoining a username after disconnect keeps a single presence entry', { skip: skipReason() }, async () => {
-  const kunal = await createIdentity();
+  const vasu = await createIdentity();
   const asha = await createIdentity();
 
   const first = io(`http://localhost:${port}`, {
@@ -78,7 +78,7 @@ test('rejoining a username after disconnect keeps a single presence entry', { sk
 
     const secondUsersPromise = new Promise((resolve) => {
       const onOnlineUsers = (list) => {
-        if (list.includes('Kunal') && list.includes('Asha')) {
+        if (list.includes('Vasu') && list.includes('Asha')) {
           second.off('online-users', onOnlineUsers);
           resolve(list);
         }
@@ -86,12 +86,12 @@ test('rejoining a username after disconnect keeps a single presence entry', { sk
       second.on('online-users', onOnlineUsers);
     });
 
-    await loginAs(first, 'Kunal', kunal);
+    await loginAs(first, 'Vasu', vasu);
     await loginAs(second, 'Asha', asha);
 
     const userListAfterJoin = await secondUsersPromise;
 
-    assert.ok(userListAfterJoin.includes('Kunal'));
+    assert.ok(userListAfterJoin.includes('Vasu'));
     assert.ok(userListAfterJoin.includes('Asha'));
 
     first.disconnect();
@@ -107,7 +107,7 @@ test('rejoining a username after disconnect keeps a single presence entry', { sk
 
     const secondUpdatedUsersPromise = new Promise((resolve) => {
       const onOnlineUsers = (list) => {
-        const count = list.filter((name) => name === 'Kunal').length;
+        const count = list.filter((name) => name === 'Vasu').length;
         if (count === 1) {
           second.off('online-users', onOnlineUsers);
           resolve(list);
@@ -117,12 +117,12 @@ test('rejoining a username after disconnect keeps a single presence entry', { sk
     });
 
     // The same identity, because the username is bound to it now. Coming back
-    // with a fresh key pair would be refused rather than treated as Kunal.
-    await loginAs(reconnecting, 'Kunal', kunal);
+    // with a fresh key pair would be refused rather than treated as Vasu.
+    await loginAs(reconnecting, 'Vasu', vasu);
     const userListAfterRejoin = await secondUpdatedUsersPromise;
 
-    assert.ok(userListAfterRejoin.includes('Kunal'));
-    assert.equal(userListAfterRejoin.filter((name) => name === 'Kunal').length, 1);
+    assert.ok(userListAfterRejoin.includes('Vasu'));
+    assert.equal(userListAfterRejoin.filter((name) => name === 'Vasu').length, 1);
 
     reconnecting.disconnect();
     second.disconnect();
